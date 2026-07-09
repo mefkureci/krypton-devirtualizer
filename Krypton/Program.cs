@@ -1,5 +1,4 @@
 using System;
-using System.Linq;
 using Krypton.Core;
 using Krypton.Pipeline;
 using Console = Colorful.Console;
@@ -16,41 +15,27 @@ namespace Krypton
             Console.Title = $"Krypton - {CurrentVersion}";
             Environment.ExitCode = 0;
 
-            var pauseOnExit =
-                !args.Any(q => string.Equals(q, "--no-pause", StringComparison.OrdinalIgnoreCase)) &&
-                !string.Equals(Environment.GetEnvironmentVariable("KRYPTON_NO_PAUSE"), "1", StringComparison.Ordinal);
+            var launchArguments = ParseArguments(args);
+            var pauseOnExit = launchArguments.PauseOnExit;
 
             try
             {
-                var strictDiagnostics = false;
-                string inputPath = null;
-
-                for (var i = 0; i < args.Length; i++)
+                if (launchArguments.ShowHelp)
                 {
-                    var arg = args[i];
-                    if (string.Equals(arg, "--strict-diagnostics", StringComparison.OrdinalIgnoreCase))
-                    {
-                        strictDiagnostics = true;
-                        continue;
-                    }
-
-                    if (!arg.StartsWith("--", StringComparison.Ordinal) && string.IsNullOrWhiteSpace(inputPath))
-                    {
-                        inputPath = arg;
-                    }
+                    WriteUsage(logger, isError: false);
+                    return;
                 }
 
-                if (string.IsNullOrWhiteSpace(inputPath))
+                if (string.IsNullOrWhiteSpace(launchArguments.InputPath))
                 {
-                    logger.Error(
-                        "Usage: Krypton.exe <input-assembly> [--strict-diagnostics] [--no-pause]");
+                    WriteUsage(logger, isError: true);
                     Environment.ExitCode = 1;
                     return;
                 }
 
-                var opts = new DevirtualizationOptions(inputPath, logger)
+                var opts = new DevirtualizationOptions(launchArguments.InputPath, logger)
                 {
-                    StrictDiagnostics = strictDiagnostics
+                    StrictDiagnostics = launchArguments.StrictDiagnostics
                 };
                 var ctx = new DevirtualizationCtx(opts);
 
@@ -74,6 +59,65 @@ namespace Krypton
                     Console.ReadKey(intercept: true);
                 }
             }
+        }
+
+        private static LauncherArguments ParseArguments(string[] args)
+        {
+            var parsed = new LauncherArguments
+            {
+                PauseOnExit = !string.Equals(
+                    Environment.GetEnvironmentVariable("KRYPTON_NO_PAUSE"),
+                    "1",
+                    StringComparison.Ordinal)
+            };
+
+            foreach (var arg in args ?? Array.Empty<string>())
+            {
+                if (string.Equals(arg, "--help", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(arg, "-h", StringComparison.OrdinalIgnoreCase))
+                {
+                    parsed.ShowHelp = true;
+                    parsed.PauseOnExit = false;
+                    continue;
+                }
+
+                if (string.Equals(arg, "--no-pause", StringComparison.OrdinalIgnoreCase))
+                {
+                    parsed.PauseOnExit = false;
+                    continue;
+                }
+
+                if (string.Equals(arg, "--strict-diagnostics", StringComparison.OrdinalIgnoreCase))
+                {
+                    parsed.StrictDiagnostics = true;
+                    continue;
+                }
+
+                if (!arg.StartsWith("--", StringComparison.Ordinal) &&
+                    string.IsNullOrWhiteSpace(parsed.InputPath))
+                {
+                    parsed.InputPath = arg;
+                }
+            }
+
+            return parsed;
+        }
+
+        private static void WriteUsage(ConsoleLogger logger, bool isError)
+        {
+            const string usage = "Usage: Krypton.exe <input-assembly> [--strict-diagnostics] [--no-pause] [--help]";
+            if (isError)
+                logger.Error(usage);
+            else
+                logger.Info(usage);
+        }
+
+        private sealed class LauncherArguments
+        {
+            public string InputPath { get; set; }
+            public bool StrictDiagnostics { get; set; }
+            public bool PauseOnExit { get; set; }
+            public bool ShowHelp { get; set; }
         }
 
     }
