@@ -88,7 +88,7 @@ namespace Krypton.Core.PatternMatching
 
         public VMOpCode FindOpCode(MethodDefinition Method, int index, bool allowFallback)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             foreach (var pat in Patterns)
                 if (MatchesPattern(pat, instructions, index) && pat.Verify(Method, index))
                 {

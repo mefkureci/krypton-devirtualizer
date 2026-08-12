@@ -32,7 +32,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return index + 12 < instructions.Count &&
                    PatternHelpers.CallsMethodNamed(instructions[index + 12], "IncludeManager");
         }
@@ -61,7 +61,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return index + 10 < instructions.Count &&
                    PatternHelpers.CallsMethodNamed(instructions[index + 10], "IncludeManager");
         }
@@ -89,7 +89,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return PatternHelpers.ContainsMethodCall(instructions, index, 64, "DefineAdvancedProxy") &&
                    PatternHelpers.ContainsOpCode(instructions, index, 64, CilOpCodes.Stelem_Ref);
         }
@@ -122,7 +122,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return PatternHelpers.ContainsMethodCall(instructions, index, 64, "DefineAdvancedProxy") &&
                    PatternHelpers.ContainsOpCode(instructions, index, 64, CilOpCodes.Stelem_Ref);
         }
@@ -156,7 +156,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            return PatternHelpers.EndsWithStateDecrementAndReturn(Method.CilMethodBody.Instructions.ToList(), index, 48);
+            return PatternHelpers.EndsWithStateDecrementAndReturn(InstructionCache.GetInstructions(Method), index, 48);
         }
     }
 
@@ -186,7 +186,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 6 >= instructions.Count)
                 return false;
 
@@ -224,7 +224,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 9 >= instructions.Count)
                 return false;
 
@@ -262,7 +262,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            return PatternHelpers.EndsWithStateDecrementAndReturn(Method.CilMethodBody.Instructions.ToList(), index, 80);
+            return PatternHelpers.EndsWithStateDecrementAndReturn(InstructionCache.GetInstructions(Method), index, 80);
         }
     }
 
@@ -298,7 +298,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 20 >= instructions.Count)
                 return false;
 
@@ -332,7 +332,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return index + 5 < instructions.Count &&
                    PatternHelpers.CallsMethodNamed(instructions[index + 4], "ReplaceTag") &&
                    PatternHelpers.CallsMethodNamed(instructions[index + 5], "IncludeManager");
@@ -366,7 +366,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 14 >= instructions.Count)
                 return false;
 
@@ -403,7 +403,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (!PatternHelpers.ContainsMethodCall(instructions, index, 64, "TrackList") ||
                 !PatternHelpers.ContainsMethodCall(instructions, index, 64, "IncludeManager"))
                 return false;
@@ -462,7 +462,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return PatternHelpers.ContainsMethodCall(instructions, index, 96, "DefineExpandableTester") &&
                    PatternHelpers.ContainsMethodCall(instructions, index, 96, "IncludeManager") &&
                    !PatternHelpers.ContainsMethodCall(instructions, index, 96, "EnforceMonoModel");
@@ -497,7 +497,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return PatternHelpers.ContainsMethodCall(instructions, index, 96, "EnforceMonoModel");
         }
     }

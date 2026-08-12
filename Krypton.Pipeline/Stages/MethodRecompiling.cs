@@ -12,6 +12,7 @@ using AsmResolver.DotNet.Signatures.Types;
 using AsmResolver.PE.DotNet.Cil;
 using Krypton.Core;
 using Krypton.Core.Architecture;
+using Krypton.Core.PatternMatching.Patterns;
 
 namespace Krypton.Pipeline.Stages
 {
@@ -56,7 +57,7 @@ namespace Krypton.Pipeline.Stages
                     {
                         artifact = new RecompiledMethodArtifact(
                             lowerer.Recompile(Ctx, method),
-                            method.MethodBody.Instructions.ToList());
+                            InstructionCache.GetInstructions(method.Parent));
                     }
 
                     LogDnlibStyleMaxStackAnalysis(Ctx, method, artifact);

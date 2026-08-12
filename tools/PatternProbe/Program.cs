@@ -6,6 +6,7 @@ using AsmResolver.PE.DotNet.Cil;
 using Krypton.Core;
 using Krypton.Core.Parser;
 using Krypton.Core.PatternMatching;
+using Krypton.Core.PatternMatching.Patterns;
 using Krypton.Pipeline.Stages;
 
 if (args.Length < 2)
@@ -29,7 +30,7 @@ if (ctx.OpcodeHandlerMethod?.CilMethodBody?.Instructions == null || ctx.OpcodeHa
 }
 
 var opcodeHandlerMethod = ctx.OpcodeHandlerMethod;
-var instructions = opcodeHandlerMethod.CilMethodBody.Instructions.ToList();
+var instructions = InstructionCache.GetInstructions(opcodeHandlerMethod);
 var patterns = typeof(PatternMatcher).Assembly.GetTypes()
     .Where(t => typeof(IPattern).IsAssignableFrom(t) && !t.IsInterface && !t.IsAbstract)
     .Select(t => (IPattern) Activator.CreateInstance(t)!)

@@ -25,7 +25,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 5 >= instructions.Count)
                 return false;
 
@@ -80,7 +80,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 22 >= instructions.Count)
                 return false;
 
@@ -129,7 +129,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 21 >= instructions.Count)
                 return false;
 
@@ -165,7 +165,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 7 >= instructions.Count)
                 return false;
 
@@ -215,7 +215,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 17 >= instructions.Count)
                 return false;
 
@@ -266,7 +266,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 28 >= instructions.Count)
                 return false;
 
@@ -318,7 +318,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 29 >= instructions.Count)
                 return false;
 
