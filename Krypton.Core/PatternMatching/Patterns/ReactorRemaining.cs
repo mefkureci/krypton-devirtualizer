@@ -49,7 +49,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return index + 29 < instructions.Count &&
                    PatternHelpers.CallsMethodNamed(instructions[index + 23], "DefineInterruptibleAuthorizer") &&
                    PatternHelpers.CallsMethodOnType(instructions[index + 29], "UpdateTransaction", "AnnotationOrder");
@@ -94,7 +94,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             if (index + 25 >= instructions.Count)
                 return false;
 
@@ -125,7 +125,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return index + 4 < instructions.Count &&
                    PatternHelpers.CallsMethodNamed(instructions[index + 4], "IncludeManager");
         }
@@ -165,7 +165,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return PatternHelpers.ContainsMethodCall(instructions, index, 400, "IncludeManager") &&
                    PatternHelpers.ContainsMethodCallOnType(instructions, index, 320, "Invoke", "System.Reflection.ConstructorInfo");
         }
@@ -212,7 +212,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return index + 28 < instructions.Count &&
                    PatternHelpers.CallsMethodOnType(instructions[index + 22], "UpdateTransaction", "TransferableIteratorAnnotation") &&
                    PatternHelpers.CallsMethodNamed(instructions[index + 28], "IncludeManager");
@@ -255,7 +255,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return index + 23 < instructions.Count &&
                    instructions[index + 19].OpCode == CilOpCodes.Ldnull &&
                    PatternHelpers.CallsMethodOnType(instructions[index + 21], "UpdateTransaction", "AnnotationProfiler") &&
@@ -301,7 +301,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return index + 25 < instructions.Count &&
                    instructions[index + 22].OpCode == CilOpCodes.Ldnull &&
                    PatternHelpers.CallsMethodOnType(instructions[index + 25], "UpdateTransaction", "AnnotationModel");
@@ -344,7 +344,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return PatternHelpers.ContainsMethodCallOnType(instructions, index, 120, "UpdateTransaction", "AnnotationModel") &&
                    PatternHelpers.ContainsOpCode(instructions, index, 120, CilOpCodes.Throw);
         }
@@ -370,7 +370,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return index + 7 < instructions.Count &&
                    PatternHelpers.CallsMethodNamed(instructions[index + 6], "DefineExternalChain") &&
                    PatternHelpers.CallsMethodNamed(instructions[index + 7], "IncludeManager");
@@ -402,7 +402,7 @@ namespace Krypton.Core.PatternMatching.Patterns
 
         public bool Verify(MethodDefinition Method, int index)
         {
-            var instructions = Method.CilMethodBody.Instructions.ToList();
+            var instructions = InstructionCache.GetInstructions(Method);
             return PatternHelpers.ContainsMethodCall(instructions, index, 96, "DefineAutomatableElement") &&
                    PatternHelpers.ContainsOpCode(instructions, index, 96, CilOpCodes.Ldelem_I4) &&
                    PatternHelpers.ContainsOpCode(instructions, index, 96, CilOpCodes.Stfld);

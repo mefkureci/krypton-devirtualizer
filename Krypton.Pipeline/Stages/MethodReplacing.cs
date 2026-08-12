@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text;
 using Krypton.Core;
 using Krypton.Core.Architecture;
+using Krypton.Core.PatternMatching.Patterns;
 
 namespace Krypton.Pipeline.Stages
 {
@@ -237,7 +238,7 @@ namespace Krypton.Pipeline.Stages
 
             return new RecompiledMethodArtifact(
                 method.RecompiledBody,
-                method.MethodBody.Instructions.ToList());
+                InstructionCache.GetInstructions(method.Parent));
         }
 
         private int ReadNonNegativeIntFromEnvironment(string variableName, int fallback)

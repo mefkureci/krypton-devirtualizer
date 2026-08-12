@@ -7,6 +7,7 @@ using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures.Types;
 using AsmResolver.PE.DotNet.Cil;
 using Krypton.Core;
+using Krypton.Core.PatternMatching.Patterns;
 
 namespace Krypton.Pipeline.Stages
 {
@@ -2739,7 +2740,7 @@ namespace Krypton.Pipeline.Stages
                 {
                     var helperArtifact = new RecompiledMethodArtifact(
                         oldBody,
-                        vmMethod.MethodBody.Instructions.ToList());
+                        InstructionCache.GetInstructions(vmMethod.Parent));
                     var helperRepair = VerifiableIlSanitizer.TryRepair(ctx, vmMethod, helperArtifact);
                     if (helperRepair.Improved && helperRepair.FinalArtifact?.Body != null)
                     {
