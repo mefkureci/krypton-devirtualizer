@@ -171,7 +171,48 @@ namespace Krypton.Runner
                 RunClassConstructor(type);
             }
 
+            PrepareRequestedMethods(assembly);
             return assembly;
+        }
+
+        // Some of the protection's delegate fields are still null after every type
+        // initializer has run: they are filled in only when a method that uses them
+        // is brought to life. The caller names those methods by token so the field
+        // read below observes the same state the method itself would see. Preparing
+        // compiles without executing, which is the least invasive trigger available;
+        // if it is not enough the caller can escalate to KRYPTON_INVOKE_TOKENS.
+        private static void PrepareRequestedMethods(Assembly assembly)
+        {
+            var raw = Environment.GetEnvironmentVariable("KRYPTON_PREPARE_TOKENS");
+            if (string.IsNullOrWhiteSpace(raw))
+                return;
+
+            foreach (var part in raw.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var token = ParseToken(part.Trim());
+                if (token == 0)
+                    continue;
+                try
+                {
+                    var method = ResolveMethod(assembly, token);
+                    if (method == null)
+                    {
+                        Console.WriteLine("[RuntimeValue] prepare 0x" + token.ToString("X8") + " : not a method");
+                        continue;
+                    }
+                    RuntimeHelpers.PrepareMethod(method.MethodHandle);
+                    Console.WriteLine("[RuntimeValue] prepared 0x" + token.ToString("X8") + " " +
+                                      (method.DeclaringType == null ? "?" : method.DeclaringType.Name) +
+                                      "::" + method.Name);
+                }
+                catch (Exception ex)
+                {
+                    var root = ex;
+                    while (root.InnerException != null) root = root.InnerException;
+                    Console.WriteLine("[RuntimeValue] prepare 0x" + token.ToString("X8") + " failed: " +
+                                      root.GetType().Name + ": " + root.Message);
+                }
+            }
         }
 
         private static void RunClassConstructor(Type type)

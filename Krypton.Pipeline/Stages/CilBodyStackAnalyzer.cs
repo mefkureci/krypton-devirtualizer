@@ -24,31 +24,21 @@ namespace Krypton.Pipeline.Stages
 
             var body = artifact.Body;
             var instructions = body.Instructions;
-            var instructionIndexByInstruction = new Dictionary<CilInstruction, int>(instructions.Count);
+            // Dispatcher specialization can emit multiple structurally identical
+            // instruction clones. Branch labels identify a specific clone, so the
+            // index must use reference identity rather than value equality.
+            var instructionIndexByInstruction = new Dictionary<CilInstruction, int>(
+                instructions.Count,
+                ReferenceEqualityComparer.Instance);
             for (var i = 0; i < instructions.Count; i++)
                 instructionIndexByInstruction[instructions[i]] = i;
 
             var result = new CilBodyAnalysisResult();
-            var seenDepths = new HashSet<int>[instructions.Count];
-            for (var i = 0; i < seenDepths.Length; i++)
-                seenDepths[i] = new HashSet<int>();
+            var worklist = new BoundedStateWorklist(instructions.Count, MaxStatesPerInstruction);
+            worklist.TryEnqueue(0, 0);
 
-            var queue = new Queue<(int index, int depth)>();
-            queue.Enqueue((0, 0));
-
-            while (queue.Count > 0)
+            while (worklist.TryDequeue(out var index, out var depth))
             {
-                var (index, depth) = queue.Dequeue();
-                if (index < 0 || index >= instructions.Count)
-                    continue;
-
-                var seen = seenDepths[index];
-                if (seen.Contains(depth))
-                    continue;
-                if (seen.Count >= MaxStatesPerInstruction)
-                    continue;
-                seen.Add(depth);
-
                 var instruction = instructions[index];
                 if (!TryGetStackEffect(vmMethod, instruction, out var pop, out var push))
                     continue;
@@ -86,7 +76,7 @@ namespace Krypton.Pipeline.Stages
                             break;
                         }
 
-                        QueueSuccessor(queue, seenDepths, artifact, result, index, target, nextDepth);
+                        QueueSuccessor(worklist, artifact, result, index, target, nextDepth);
                         break;
                     }
                     case CilCode.Leave:
@@ -97,13 +87,19 @@ namespace Krypton.Pipeline.Stages
                             break;
                         }
 
-                        QueueSuccessor(queue, seenDepths, artifact, result, index, target, 0);
+                        QueueSuccessor(worklist, artifact, result, index, target, 0);
                         break;
                     }
                     case CilCode.Brtrue:
                     case CilCode.Brfalse:
                     case CilCode.Blt_Un:
                     case CilCode.Bge_Un:
+                    case CilCode.Blt:
+                    case CilCode.Bgt:
+                    case CilCode.Ble:
+                    case CilCode.Bge:
+                    case CilCode.Beq:
+                    case CilCode.Bne_Un:
                     {
                         if (!TryGetTargetIndex(instruction.Operand, instructionIndexByInstruction, out var target))
                         {
@@ -111,8 +107,8 @@ namespace Krypton.Pipeline.Stages
                             break;
                         }
 
-                        QueueSuccessor(queue, seenDepths, artifact, result, index, target, nextDepth);
-                        EnqueueFallThrough(queue, seenDepths, artifact, result, index, nextDepth, instructions.Count);
+                        QueueSuccessor(worklist, artifact, result, index, target, nextDepth);
+                        EnqueueFallThrough(worklist, artifact, result, index, nextDepth, instructions.Count);
                         break;
                     }
                     case CilCode.Switch:
@@ -131,17 +127,17 @@ namespace Krypton.Pipeline.Stages
                                 continue;
                             }
 
-                            QueueSuccessor(queue, seenDepths, artifact, result, index, target, nextDepth);
+                            QueueSuccessor(worklist, artifact, result, index, target, nextDepth);
                         }
 
-                        EnqueueFallThrough(queue, seenDepths, artifact, result, index, nextDepth, instructions.Count);
+                        EnqueueFallThrough(worklist, artifact, result, index, nextDepth, instructions.Count);
                         break;
                     }
                     case CilCode.Ret:
                     case CilCode.Endfinally:
                         break;
                     default:
-                        EnqueueFallThrough(queue, seenDepths, artifact, result, index, nextDepth, instructions.Count);
+                        EnqueueFallThrough(worklist, artifact, result, index, nextDepth, instructions.Count);
                         break;
                 }
             }
@@ -166,8 +162,7 @@ namespace Krypton.Pipeline.Stages
         }
 
         private static void EnqueueFallThrough(
-            Queue<(int index, int depth)> queue,
-            IReadOnlyList<HashSet<int>> seenDepths,
+            BoundedStateWorklist worklist,
             RecompiledMethodArtifact artifact,
             CilBodyAnalysisResult result,
             int sourceIndex,
@@ -176,40 +171,38 @@ namespace Krypton.Pipeline.Stages
         {
             var next = sourceIndex + 1;
             if (next >= 0 && next < count)
-                QueueSuccessor(queue, seenDepths, artifact, result, sourceIndex, next, depth);
+                QueueSuccessor(worklist, artifact, result, sourceIndex, next, depth);
         }
 
         private static void QueueSuccessor(
-            Queue<(int index, int depth)> queue,
-            IReadOnlyList<HashSet<int>> seenDepths,
+            BoundedStateWorklist worklist,
             RecompiledMethodArtifact artifact,
             CilBodyAnalysisResult result,
             int sourceIndex,
             int targetIndex,
             int depth)
         {
-            if (targetIndex < 0 || targetIndex >= seenDepths.Count)
+            var discovered = worklist.GetDiscoveredDepths(targetIndex);
+            if (discovered.Contains(depth))
                 return;
-
-            var seen = seenDepths[targetIndex];
-            if (seen.Count >= MaxStatesPerInstruction)
+            if (discovered.Count >= MaxStatesPerInstruction)
             {
                 RegisterIssue(result, artifact.InstructionOrigins, sourceIndex, $"state explosion on edge {sourceIndex}->{targetIndex}: exceeded {MaxStatesPerInstruction} incoming depths");
                 return;
             }
 
-            if (seen.Count > 0 && !seen.Contains(depth))
+            if (discovered.Count > 0)
             {
                 RegisterIssue(
                     result,
                     artifact.InstructionOrigins,
                     sourceIndex,
-                    $"stack-depth merge mismatch on edge {sourceIndex}->{targetIndex}: {string.Join("/", seen.OrderBy(q => q))} vs {depth}");
+                    $"stack-depth merge mismatch on edge {sourceIndex}->{targetIndex}: {string.Join("/", discovered.OrderBy(q => q))} vs {depth}");
                 if (targetIndex >= 0)
                     result.IssueInstructionIndices.Add(targetIndex);
             }
 
-            queue.Enqueue((targetIndex, depth));
+            worklist.TryEnqueue(targetIndex, depth);
         }
 
         private static bool TryGetTargetIndex(
@@ -255,6 +248,7 @@ namespace Krypton.Pipeline.Stages
             switch (instruction.OpCode.Code)
             {
                 case CilCode.Nop:
+                case CilCode.Constrained:
                     return true;
 
                 case CilCode.Ldarg:
@@ -263,6 +257,7 @@ namespace Krypton.Pipeline.Stages
                 case CilCode.Ldarg_2:
                 case CilCode.Ldarg_3:
                 case CilCode.Ldloc:
+                case CilCode.Ldloca:
                 case CilCode.Ldloc_0:
                 case CilCode.Ldloc_1:
                 case CilCode.Ldloc_2:
@@ -285,6 +280,7 @@ namespace Krypton.Pipeline.Stages
                 case CilCode.Ldnull:
                 case CilCode.Ldtoken:
                 case CilCode.Ldsfld:
+                case CilCode.Ldsflda:
                     push = 1;
                     return true;
 
@@ -316,10 +312,17 @@ namespace Krypton.Pipeline.Stages
 
                 case CilCode.Blt_Un:
                 case CilCode.Bge_Un:
+                case CilCode.Blt:
+                case CilCode.Bgt:
+                case CilCode.Ble:
+                case CilCode.Bge:
+                case CilCode.Beq:
+                case CilCode.Bne_Un:
                     pop = 2;
                     return true;
 
                 case CilCode.Add:
+                case CilCode.Ceq:
                 case CilCode.Sub:
                 case CilCode.Xor:
                 case CilCode.Shl:
@@ -335,6 +338,10 @@ namespace Krypton.Pipeline.Stages
                 case CilCode.Conv_U1:
                 case CilCode.Ldlen:
                 case CilCode.Unbox_Any:
+                case CilCode.Isinst:
+                case CilCode.Castclass:
+                case CilCode.Ldflda:
+                case CilCode.Box:
                 case CilCode.Ldind_I1:
                 case CilCode.Ldind_U1:
                 case CilCode.Ldind_I2:

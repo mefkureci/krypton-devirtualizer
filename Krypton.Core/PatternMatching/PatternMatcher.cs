@@ -160,6 +160,10 @@ namespace Krypton.Core.PatternMatching
             if (LooksLikeLdstr(instructions, index, end))
                 return VMOpCode.Ldstr;
 
+            var fieldAccess = TryInferFieldAccess(instructions, index, end);
+            if (fieldAccess != VMOpCode.Nop)
+                return fieldAccess;
+
             if (LooksLikeLdfld(instructions, index, end))
                 return VMOpCode.Ldfld;
 
@@ -213,6 +217,40 @@ namespace Krypton.Core.PatternMatching
             var binary = TryInferBinaryOperation(method, instructions, index, end);
             if (binary != VMOpCode.Nop)
                 return binary;
+
+            return VMOpCode.Nop;
+        }
+
+        private VMOpCode TryInferFieldAccess(
+            IReadOnlyList<CilInstruction> instructions,
+            int index,
+            int end)
+        {
+            for (var i = index; i <= end; i++)
+            {
+                var instruction = instructions[i];
+                if (!(instruction?.Operand is IMethodDescriptor descriptor))
+                    continue;
+
+                var declaringType = descriptor.DeclaringType?.FullName;
+                if (!string.Equals(declaringType, "System.Reflection.FieldInfo", StringComparison.Ordinal))
+                    continue;
+
+                var name = descriptor.Name?.ToString();
+                if (string.Equals(name, "GetValue", StringComparison.Ordinal) && i >= index + 2)
+                {
+                    return instructions[i - 1].OpCode == CilOpCodes.Ldnull
+                        ? VMOpCode.Ldsfld
+                        : VMOpCode.Ldfld;
+                }
+
+                if (string.Equals(name, "SetValue", StringComparison.Ordinal) && i >= index + 3)
+                {
+                    return instructions[i - 2].OpCode == CilOpCodes.Ldnull
+                        ? VMOpCode.Stsfld
+                        : VMOpCode.Stfld;
+                }
+            }
 
             return VMOpCode.Nop;
         }
@@ -552,6 +590,12 @@ namespace Krypton.Core.PatternMatching
                     detected.Add(VMOpCode.Conv_I8);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Conv_U1, 10))
                     detected.Add(VMOpCode.Conv_U1);
+                if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Conv_U4, 10))
+                    detected.Add(VMOpCode.Conv_U4);
+                if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Conv_U8, 10))
+                    detected.Add(VMOpCode.Conv_U8);
+                if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Conv_Ovf_I4, 10))
+                    detected.Add(VMOpCode.Conv_Ovf_I4);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Not, 10))
                     detected.Add(VMOpCode.Not);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Neg, 10))
@@ -577,6 +621,8 @@ namespace Krypton.Core.PatternMatching
                     detected.Add(VMOpCode.Add);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Sub, 10))
                     detected.Add(VMOpCode.Sub);
+                if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Mul, 10))
+                    detected.Add(VMOpCode.Mul);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Xor, 10))
                     detected.Add(VMOpCode.Xor);
                 if (PatternHelpers.CalleeContainsOpCode(method, candidate, CilCode.Shl, 10))

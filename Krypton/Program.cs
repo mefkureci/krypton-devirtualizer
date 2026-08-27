@@ -33,6 +33,8 @@ namespace Krypton
                     return;
                 }
 
+                LogBuildProvenance(logger);
+
                 var opts = new DevirtualizationOptions(launchArguments.InputPath, logger)
                 {
                     StrictDiagnostics = launchArguments.StrictDiagnostics
@@ -41,7 +43,8 @@ namespace Krypton
 
                 var devirtualizer = new Devirtualizer(ctx);
                 devirtualizer.Devirtualize();
-                devirtualizer.Save();
+                if (!devirtualizer.InventoryOnlyCompleted)
+                    devirtualizer.Save();
             }
             catch (Exception ex)
             {
@@ -58,6 +61,34 @@ namespace Krypton
                     Console.WriteLine("Press any key to close...");
                     Console.ReadKey(intercept: true);
                 }
+            }
+        }
+
+        // A silently stale binary produces experiment results that look real and
+        // are not. Print exactly which pipeline build is running so a run can
+        // always be tied back to the code that produced it.
+        private static void LogBuildProvenance(ConsoleLogger logger)
+        {
+            try
+            {
+                var assembly = typeof(Pipeline.Devirtualizer).Assembly;
+                var path = assembly.Location;
+                if (string.IsNullOrEmpty(path) || !System.IO.File.Exists(path))
+                    return;
+
+                var info = new System.IO.FileInfo(path);
+                string hash;
+                using (var stream = System.IO.File.OpenRead(path))
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    hash = BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", string.Empty).Substring(0, 16);
+                }
+
+                logger.Info($"Pipeline build: {info.Name} | {info.LastWriteTimeUtc:yyyy-MM-dd HH:mm:ss}Z | sha256:{hash.ToLowerInvariant()}");
+            }
+            catch
+            {
+                // Provenance is diagnostic only; never let it stop a run.
             }
         }
 

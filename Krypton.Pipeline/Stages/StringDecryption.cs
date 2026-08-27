@@ -89,6 +89,192 @@ namespace Krypton.Pipeline.Stages
                 ctx.Options.Logger.Info($"StringDecryption: total {totalPatched} string(s) inlined.");
         }
 
+        // -- Keyed decoder sites ---------------------------------------------------
+        //
+        // A second Reactor variant keys every string id with a value that only exists
+        // once the protection bootstrap has run:
+        //
+        //     <constant integer expression>
+        //     ldsfld  <runtime singleton>
+        //     ldfld   <int key field on the singleton>
+        //     xor
+        //     call    <decoder>(int32) -> string
+        //
+        // The shape is recognised here; the decoded values come from evidence captured
+        // against the live original, keyed by (key field, folded constant). Nothing is
+        // rewritten unless the shape matches AND the pair is present in that evidence.
+        public static int InlineKeyedDecoderCalls(
+            IEnumerable<MethodDefinition> methods,
+            uint singletonToken,
+            uint decoderToken,
+            IReadOnlyDictionary<(uint KeyField, uint Encoded), string> values,
+            Action<string> report,
+            ICollection<(uint KeyField, uint Encoded)> missing = null)
+        {
+            var patched = 0;
+            foreach (var method in methods)
+            {
+                var body = method?.CilMethodBody;
+                if (body == null)
+                    continue;
+
+                var instructions = body.Instructions;
+                for (var i = 0; i + 3 < instructions.Count; i++)
+                {
+                    if (instructions[i].OpCode.Code != CilCode.Ldsfld ||
+                        TokenOf(instructions[i].Operand) != singletonToken ||
+                        instructions[i + 1].OpCode.Code != CilCode.Ldfld ||
+                        instructions[i + 2].OpCode.Code != CilCode.Xor ||
+                        instructions[i + 3].OpCode.Code != CilCode.Call ||
+                        TokenOf(instructions[i + 3].Operand) != decoderToken)
+                    {
+                        continue;
+                    }
+
+                    var keyField = TokenOf(instructions[i + 1].Operand);
+                    var start = -1;
+                    uint encoded = 0;
+                    for (var span = 1; span <= 12 && i - span >= 0; span++)
+                    {
+                        if (TryFoldConstant(instructions, i - span, i, out encoded))
+                        {
+                            start = i - span;
+                            break;
+                        }
+                    }
+
+                    if (start < 0)
+                    {
+                        report?.Invoke(
+                            $"keyed decoder site in {method.Name}: the id expression did not fold");
+                        continue;
+                    }
+
+                    if (!values.TryGetValue((keyField, encoded), out var text) || text == null)
+                    {
+                        // The site is fully identified even without a value for it, so
+                        // hand the pair back: the caller can ask the live original what
+                        // it decodes to instead of leaving the literal unresolved.
+                        missing?.Add((keyField, encoded));
+                        report?.Invoke(
+                            $"keyed decoder site in {method.Name}: no evidence for key " +
+                            $"0x{keyField:X8} id 0x{encoded:X8}");
+                        continue;
+                    }
+
+                    // Mutate in place so existing branch labels keep pointing at live
+                    // instructions instead of being rebound to a new object.
+                    instructions[start].OpCode = CilOpCodes.Ldstr;
+                    instructions[start].Operand = text;
+                    for (var k = start + 1; k <= i + 3; k++)
+                    {
+                        instructions[k].OpCode = CilOpCodes.Nop;
+                        instructions[k].Operand = null;
+                    }
+
+                    patched++;
+                    i += 3;
+                }
+            }
+
+            return patched;
+        }
+
+        private static uint TokenOf(object operand)
+        {
+            return operand is IMetadataMember member ? member.MetadataToken.ToUInt32() : 0u;
+        }
+
+        private static bool TryFoldConstant(
+            IList<CilInstruction> instructions, int from, int to, out uint result)
+        {
+            result = 0;
+            var stack = new List<int>();
+            for (var i = from; i < to; i++)
+            {
+                var instruction = instructions[i];
+                if (TryGetInt32Constant(instruction, out var constant))
+                {
+                    stack.Add(constant);
+                    continue;
+                }
+
+                switch (instruction.OpCode.Code)
+                {
+                    case CilCode.Add:
+                    case CilCode.Sub:
+                    case CilCode.Mul:
+                    case CilCode.And:
+                    case CilCode.Or:
+                    case CilCode.Xor:
+                    case CilCode.Shl:
+                    case CilCode.Shr:
+                    case CilCode.Shr_Un:
+                    {
+                        if (stack.Count < 2)
+                            return false;
+                        var b = stack[stack.Count - 1];
+                        var a = stack[stack.Count - 2];
+                        stack.RemoveAt(stack.Count - 1);
+                        stack.RemoveAt(stack.Count - 1);
+                        int folded;
+                        switch (instruction.OpCode.Code)
+                        {
+                            case CilCode.Add: folded = unchecked(a + b); break;
+                            case CilCode.Sub: folded = unchecked(a - b); break;
+                            case CilCode.Mul: folded = unchecked(a * b); break;
+                            case CilCode.And: folded = a & b; break;
+                            case CilCode.Or: folded = a | b; break;
+                            case CilCode.Xor: folded = a ^ b; break;
+                            case CilCode.Shl: folded = a << (b & 31); break;
+                            case CilCode.Shr: folded = a >> (b & 31); break;
+                            default: folded = unchecked((int)((uint)a >> (b & 31))); break;
+                        }
+                        stack.Add(folded);
+                        break;
+                    }
+                    case CilCode.Neg:
+                    case CilCode.Not:
+                    {
+                        if (stack.Count < 1)
+                            return false;
+                        var a = stack[stack.Count - 1];
+                        stack.RemoveAt(stack.Count - 1);
+                        stack.Add(instruction.OpCode.Code == CilCode.Neg ? unchecked(-a) : ~a);
+                        break;
+                    }
+                    default:
+                        return false;
+                }
+            }
+
+            if (stack.Count != 1)
+                return false;
+            result = unchecked((uint)stack[0]);
+            return true;
+        }
+
+        private static bool TryGetInt32Constant(CilInstruction instruction, out int value)
+        {
+            value = 0;
+            switch (instruction.OpCode.Code)
+            {
+                case CilCode.Ldc_I4_M1: value = -1; return true;
+                case CilCode.Ldc_I4_0: value = 0; return true;
+                case CilCode.Ldc_I4_1: value = 1; return true;
+                case CilCode.Ldc_I4_2: value = 2; return true;
+                case CilCode.Ldc_I4_3: value = 3; return true;
+                case CilCode.Ldc_I4_4: value = 4; return true;
+                case CilCode.Ldc_I4_5: value = 5; return true;
+                case CilCode.Ldc_I4_6: value = 6; return true;
+                case CilCode.Ldc_I4_7: value = 7; return true;
+                case CilCode.Ldc_I4_8: value = 8; return true;
+                case CilCode.Ldc_I4_S: value = Convert.ToInt32(instruction.Operand); return true;
+                case CilCode.Ldc_I4: value = Convert.ToInt32(instruction.Operand); return true;
+                default: return false;
+            }
+        }
+
         // ── Detection ──────────────────────────────────────────────────────────────
 
         private static List<(MethodDefinition Decoder, string ResourceName)> FindStringDecoderMethods(

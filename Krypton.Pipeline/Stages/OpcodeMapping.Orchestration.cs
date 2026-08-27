@@ -39,6 +39,18 @@ namespace Krypton.Pipeline.Stages
             MapOpcodes(Ctx);
         }
 
+
+        // Sound mode removes every path that turns "several candidates remain" into
+        // a mapping. A byte with insufficient evidence must stay unresolved: a wrong
+        // opcode asserted at high confidence is worse than an admitted gap, because
+        // later stages consume it as if it were established.
+        internal static bool IsSoundModeEnabled()
+        {
+            var raw = Environment.GetEnvironmentVariable("KRYPTON_SOUND_MODE");
+            return string.Equals(raw, "1", StringComparison.Ordinal) ||
+                   string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase);
+        }
+
         public void MapOpcodes(DevirtualizationCtx Ctx)
         {
             Ctx.OpcodeConfidence = new Dictionary<int, OpcodeMappingConfidence>();
@@ -73,9 +85,52 @@ namespace Krypton.Pipeline.Stages
 
             if (!(switchOpCode.Operand is IList<ICilLabel> values))
                 throw new DevirtualizationException("Opcode handler switch has an unexpected operand type.");
-            Ctx.OpcodeHandlerIndices = new Dictionary<int, int>();
 
-            var addressableHandlerCount = Math.Min(values.Count, _addressableOpcodeCount);
+            // Validate before trusting: control-flow flattening produces the same
+            // large-switch shape as a VM dispatcher. A rejected candidate must not
+            // merely be down-weighted, because handler evidence is applied at the
+            // highest confidence and is protected from later revision -- feeding it
+            // arbitrary flattened blocks is strictly worse than having no handler.
+            var dispatcherValidation = DispatcherValidator.Validate(
+                opcodeHandlerMethod,
+                switchOpCode,
+                observedVmByteHistogram.Count);
+            Ctx.DispatcherValidationSummary = dispatcherValidation.Format();
+            foreach (var line in dispatcherValidation.Format().Split('\n'))
+                Ctx.Options.Logger.Info(line.TrimEnd());
+
+            // Dropping rejected handler evidence is correct in principle, but on
+            // this family of samples it measurably degrades the result: the bogus
+            // evidence is load-bearing, and without a ground-truth anchor to take
+            // its place the mapping search just converges on a different degenerate
+            // fixed point (Shl as a catch-all becomes Pop as a catch-all). Keep the
+            // enforcement opt-in until type-based anchoring can replace it.
+            var enforceValidation = IsEnvironmentEnabled("KRYPTON_ENFORCE_DISPATCHER_VALIDATION");
+            Ctx.HandlerEvidenceEnabled = dispatcherValidation.HandlerEvidenceAllowed || !enforceValidation;
+
+            if (!Ctx.HandlerEvidenceEnabled)
+            {
+                Ctx.Options.Logger.Warning(
+                    "Dispatcher candidate REJECTED: handler-derived evidence is disabled for this sample.");
+                Ctx.OpcodeHandlerMethod = null;
+                Ctx.OpcodeHandlerIndices = null;
+            }
+            else
+            {
+                if (!dispatcherValidation.HandlerEvidenceAllowed)
+                {
+                    Ctx.Options.Logger.Warning(
+                        "Dispatcher candidate REJECTED but handler evidence is still being used. " +
+                        "Every handler-derived mapping below is UNTRUSTED. " +
+                        "Set KRYPTON_ENFORCE_DISPATCHER_VALIDATION=1 to drop it.");
+                }
+
+                Ctx.OpcodeHandlerIndices = new Dictionary<int, int>();
+            }
+
+            var addressableHandlerCount = Ctx.HandlerEvidenceEnabled
+                ? Math.Min(values.Count, _addressableOpcodeCount)
+                : 0;
             for (var i = 0; i < addressableHandlerCount; i++)
             {
                 if (!(values[i] is CilInstructionLabel instructionLabel) || instructionLabel.Instruction == null)
@@ -142,6 +197,7 @@ namespace Krypton.Pipeline.Stages
             IList<ICilLabel> switchLabels)
         {
             var strict = IsStrictMappingMode();
+            InferFloatingPointConstantsFromOperandTypes(ctx);
             InferStructurallyUniqueOperandOpcodes(ctx);
             InferUnmappedOpcodesFromOperandSemantics(ctx);
             InferUnknownByIntrinsicTypeTokenHandlers(ctx);
@@ -153,6 +209,36 @@ namespace Krypton.Pipeline.Stages
             if (!strict || IsEnvironmentEnabled("KRYPTON_ENABLE_NEIGHBOR_CONTEXT_IN_STRICT"))
                 InferUnknownByNeighborContext(ctx);
             InferUnknownDupBeforeStructuredStelemRef(ctx);
+        }
+
+        private void InferFloatingPointConstantsFromOperandTypes(DevirtualizationCtx ctx)
+        {
+            var operandTypes = ctx?.GetOperandTypes();
+            if (operandTypes == null)
+                return;
+
+            var mapped = 0;
+            for (var vmByte = 0; vmByte < operandTypes.Length; vmByte++)
+            {
+                VMOpCode opCode;
+                switch (operandTypes[vmByte])
+                {
+                    case 3:
+                        opCode = VMOpCode.Ldc_R4;
+                        break;
+                    case 4:
+                        opCode = VMOpCode.Ldc_R8;
+                        break;
+                    default:
+                        continue;
+                }
+
+                ApplyMapping(ctx, vmByte, opCode, 1.0, "operand-semantics");
+                mapped++;
+            }
+
+            if (mapped > 0)
+                ctx.Options.Logger.Info($"Floating-point operand inference mapped {mapped} VM opcode(s).");
         }
 
         private void ExecuteScoringPhase(DevirtualizationCtx ctx)
@@ -167,7 +253,8 @@ namespace Krypton.Pipeline.Stages
             InferReactorVersionAwareDispatcherBranches(ctx);
             InferSmallUnknownSetByJointStackSearch(ctx);
             if (!strict || IsEnvironmentEnabled("KRYPTON_ENABLE_LAST_RESORT_IN_STRICT"))
-                InferLastResortRareUnknowns(ctx);
+                if (!IsSoundModeEnabled())
+                    InferLastResortRareUnknowns(ctx);
         }
 
         private void ExecutePruningPhase(DevirtualizationCtx ctx)
@@ -191,7 +278,8 @@ namespace Krypton.Pipeline.Stages
             InferRareOperand1BranchesByTargetAndNeighbors(ctx);
             InferReactorVersionAwareDispatcherBranches(ctx);
             if (!strict || IsEnvironmentEnabled("KRYPTON_ENABLE_LAST_RESORT_IN_STRICT"))
-                InferLastResortRareUnknowns(ctx);
+                if (!IsSoundModeEnabled())
+                    InferLastResortRareUnknowns(ctx);
             RetuneRareHighRiskArithmeticMappings(ctx);
             RetuneSuspiciousUnaryMappingsByBinaryContext(ctx);
         }
@@ -203,9 +291,11 @@ namespace Krypton.Pipeline.Stages
             ApplyEnvironmentOpcodeOverrides(ctx);
             if (strict && IsEnvironmentEnabled("KRYPTON_ENABLE_STRICT_BRANCH_RESOLVER", true))
                 ResolveRemainingUnknownBranchesStrict(ctx);
-            InferSingletonOperand0TieAsNoOp(ctx);
+            if (!IsSoundModeEnabled())
+                InferSingletonOperand0TieAsNoOp(ctx);
             if (!strict || IsEnvironmentEnabled("KRYPTON_ENABLE_AGGRESSIVE_RESOLVER_IN_STRICT"))
-                ResolveRemainingUnknownOpcodesAggressively(ctx);
+                if (!IsSoundModeEnabled())
+                    ResolveRemainingUnknownOpcodesAggressively(ctx);
             PruneOperandIncompatibleMappings(ctx);
             PruneSemanticallyInvalidIndexLikeMappings(ctx);
             LogRemainingUnknownCandidates(ctx);
@@ -353,6 +443,18 @@ namespace Krypton.Pipeline.Stages
                 $"Best-effort stage '{phase}' failed: {ex.Message}. Continuing with partial heuristics.");
         }
 
+        // Every inference in this pipeline funnels through here, so this is the one
+        // place where sound mode can be enforced without depending on each new
+        // inference remembering to opt out. Only evidence that does not read the
+        // opcode table may write to it.
+        private static readonly HashSet<string> IndependentEvidenceSources = new HashSet<string>(
+            new[]
+            {
+                "metadata-signature", "global-stack-proof", "env-override",
+                RuntimeTraceAnchors.EvidenceSource
+            },
+            StringComparer.Ordinal);
+
         private void ApplyMapping(
             DevirtualizationCtx ctx,
             int vmByte,
@@ -362,6 +464,17 @@ namespace Krypton.Pipeline.Stages
         {
             if (ctx?.PatternMatcher == null)
                 return;
+
+            if (IsSoundModeEnabled() && !IndependentEvidenceSources.Contains(source ?? string.Empty))
+            {
+                if (IsEnvironmentEnabled("KRYPTON_LOG_SOUND_REFUSALS"))
+                {
+                    ctx.Options.Logger.Info(
+                        $"[sound] refused vm 0x{vmByte:X2} -> {opCode} from derived source '{source}'.");
+                }
+
+                return;
+            }
 
             if (opCode == VMOpCode.Nop)
                 ctx.PatternMatcher.MarkKnownNoOpValue(vmByte);

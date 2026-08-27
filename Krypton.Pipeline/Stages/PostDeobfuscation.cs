@@ -62,6 +62,7 @@ namespace Krypton.Pipeline.Stages
             public bool SimplifyBranches { get; set; }
             public bool SafeCflowCleanup { get; set; }
             public bool SafeCflowIncludeNonRecompiled { get; set; }
+            public bool ReactorDispatcherRecovery { get; set; }
             public bool SimplifyWrappers { get; set; }
             public bool InlineTrivialWrappers { get; set; }
             public bool ResolveDelegateCalls { get; set; }
@@ -119,6 +120,7 @@ namespace Krypton.Pipeline.Stages
                 SimplifyBranches = DefaultOn("KRYPTON_CLEAN_SIMPLIFY_BRANCHES", false),
                 SafeCflowCleanup = DefaultOn("KRYPTON_CLEAN_CFLOW_SAFE", true),
                 SafeCflowIncludeNonRecompiled = DefaultOn("KRYPTON_CLEAN_CFLOW_INCLUDE_NONRECOMPILED", true),
+                ReactorDispatcherRecovery = DefaultOn("KRYPTON_CLEAN_REACTOR_DISPATCHER", true),
                 SimplifyWrappers = DefaultOn("KRYPTON_CLEAN_SIMPLIFY_WRAPPERS", false),
                 InlineTrivialWrappers = DefaultOn("KRYPTON_CLEAN_INLINE_WRAPPERS", false),
                 ResolveDelegateCalls = DefaultOn("KRYPTON_CLEAN_RESOLVE_DELEGATES", false),
@@ -138,8 +140,12 @@ namespace Krypton.Pipeline.Stages
         {
             var cleaned = 0;
             var safeCflowCleaned = 0;
+            var reactorCleaned = 0;
             var methodAllow = BuildMethodAllowList(ctx, module, options);
             var safeCflowAllow = BuildSafeCflowAllowList(ctx, module, options);
+            var reactorFieldConstants = options.ReactorDispatcherRecovery
+                ? DiscoverReactorFieldConstants(module)
+                : new Dictionary<FieldDefinition, int>();
             foreach (var method in module.GetAllTypes().SelectMany(t => t.Methods))
             {
                 if (!method.HasMethodBody)
@@ -148,13 +154,15 @@ namespace Krypton.Pipeline.Stages
                     continue;
 
                 var body = method.CilMethodBody;
+                if (options.ReactorDispatcherRecovery && safeCflowAllow(method))
+                    reactorCleaned += InlineKnownReactorFieldConstants(body, reactorFieldConstants);
                 if (options.SafeCflowCleanup && safeCflowAllow(method))
-                    safeCflowCleaned += ApplySafeControlFlowCleanup(body);
+                    safeCflowCleaned += ApplySafeControlFlowCleanup(method);
 
                 if (methodAllow(method))
                 {
                     if (options.RemoveNops)
-                        cleaned += RemoveNopsAndRetarget(body);
+                        cleaned += RemoveNopsAndRetarget(method);
                     if (options.SimplifyBranches)
                         cleaned += RemoveTrivialBranches(body);
                 }
@@ -164,15 +172,32 @@ namespace Krypton.Pipeline.Stages
                 ctx.Options.Logger.Info($"Post-deobf simplified {cleaned} instruction(s).");
             if (safeCflowCleaned > 0)
                 ctx.Options.Logger.Info($"Post-deobf safe-cflow simplified {safeCflowCleaned} control-flow item(s).");
+            if (reactorCleaned > 0)
+                ctx.Options.Logger.Info($"Post-deobf Reactor recovery inlined {reactorCleaned} constant field access(es) from {reactorFieldConstants.Count} discovered field value(s).");
         }
 
-        private static int RemoveNopsAndRetarget(CilMethodBody body)
+        private static int RemoveNopsAndRetarget(MethodDefinition method)
         {
+            var body = method.CilMethodBody;
             var instructions = body.Instructions;
             if (instructions.Count == 0)
                 return 0;
 
-            var nextNonNop = new Dictionary<CilInstruction, CilInstruction>();
+            // A trailing Nop with nothing after it usually stands in for the VM's
+            // return point. Branches/labels that still target it would otherwise
+            // go dangling once it is stripped below, which resolves to offset 0
+            // at write time instead of the intended fall-through return.
+            if (instructions[instructions.Count - 1].OpCode == CilOpCodes.Nop &&
+                string.Equals(method.Signature?.ReturnType?.FullName, "System.Void", StringComparison.Ordinal))
+            {
+                instructions.Add(new CilInstruction(CilOpCodes.Ret));
+            }
+
+            // Specialized dispatcher bodies contain many structurally identical
+            // clones. A NOP must be retargeted within its own clone, so key this
+            // table by instruction identity rather than value equality.
+            var nextNonNop = new Dictionary<CilInstruction, CilInstruction>(
+                ReferenceEqualityComparer.Instance);
             for (int i = instructions.Count - 1; i >= 0; i--)
             {
                 var current = instructions[i];
@@ -192,6 +217,14 @@ namespace Krypton.Pipeline.Stages
                     instr.Operand = nextNonNop[target];
                     retargeted++;
                 }
+                else if (instr.Operand is CilInstructionLabel label &&
+                         label.Instruction != null &&
+                         label.Instruction.OpCode == CilOpCodes.Nop &&
+                         nextNonNop.TryGetValue(label.Instruction, out var nextTarget))
+                {
+                    instr.Operand = new CilInstructionLabel(nextTarget);
+                    retargeted++;
+                }
                 else if (instr.Operand is IList<CilInstruction> targets)
                 {
                     for (int i = 0; i < targets.Count; i++)
@@ -202,6 +235,22 @@ namespace Krypton.Pipeline.Stages
                             targets[i] = nextNonNop[t];
                             retargeted++;
                         }
+                    }
+                }
+                else if (instr.Operand is IList<ICilLabel> labels)
+                {
+                    for (int i = 0; i < labels.Count; i++)
+                    {
+                        if (!(labels[i] is CilInstructionLabel targetLabel) ||
+                            targetLabel.Instruction == null ||
+                            targetLabel.Instruction.OpCode != CilOpCodes.Nop ||
+                            !nextNonNop.TryGetValue(targetLabel.Instruction, out var nextLabelTarget))
+                        {
+                            continue;
+                        }
+
+                        labels[i] = new CilInstructionLabel(nextLabelTarget);
+                        retargeted++;
                     }
                 }
             }
@@ -246,8 +295,9 @@ namespace Krypton.Pipeline.Stages
             return removed;
         }
 
-        private static int ApplySafeControlFlowCleanup(CilMethodBody body)
+        private static int ApplySafeControlFlowCleanup(MethodDefinition method)
         {
+            var body = method?.CilMethodBody;
             if (body?.Instructions == null || body.Instructions.Count == 0)
                 return 0;
 
@@ -255,10 +305,15 @@ namespace Krypton.Pipeline.Stages
             for (var iter = 0; iter < 12; iter++)
             {
                 var round = 0;
+                round += RecoverReactorDispatcherTransitions(method);
+                round += RecoverDirectReactorSwitchTransitions(method);
                 round += EliminateOpaquePredicates(body);
+                round += RemoveDiscardedConstants(body);
                 round += ThreadBranchTargets(body);
                 round += SimplifyUniformSwitchDispatch(body);
                 round += RemoveTrivialBranches(body);
+                if (body.ExceptionHandlers.Count == 0)
+                    round += RemoveUnreachableInstructions(body);
                 if (round == 0)
                     break;
                 total += round;
@@ -268,6 +323,507 @@ namespace Krypton.Pipeline.Stages
             // CilOffsetLabel-based exception handler boundaries in old-format PE files
             // are not resolved by ResolveLabelInstruction and would become dangling.
             return total;
+        }
+
+        private static int RemoveDiscardedConstants(CilMethodBody body)
+        {
+            var instructions = body.Instructions;
+            var targeted = BuildTargetedInstructionSet(body);
+            var changed = 0;
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                if (!TryGetConstInt32(instructions[i], out _) || targeted.Contains(instructions[i]))
+                    continue;
+
+                var popIndex = NextNonNopIndex(instructions, i + 1);
+                if (popIndex < 0 || instructions[popIndex].OpCode != CilOpCodes.Pop)
+                    continue;
+
+                var hasTargetedInterior = false;
+                for (var j = i + 1; j <= popIndex; j++)
+                    hasTargetedInterior |= targeted.Contains(instructions[j]);
+                if (hasTargetedInterior)
+                    continue;
+
+                MakeNop(instructions[i]);
+                MakeNop(instructions[popIndex]);
+                changed += 2;
+                i = popIndex;
+            }
+            return changed;
+        }
+
+        /// <summary>
+        /// Reconnects constant state transitions produced by .NET Reactor control-flow
+        /// flattening.  Reactor commonly funnels both the method entry and every case
+        /// through this shape:
+        ///
+        ///     ldc.i4 state; br store
+        /// store: stloc selector
+        ///        ldloc selector
+        ///        switch (...)
+        ///
+        /// Some variants branch directly to the switch with the state still on the
+        /// evaluation stack.  Once opaque predicates have been folded, both shapes can
+        /// be replaced with a direct edge to the selected case.  Out-of-range states are
+        /// resolved through the small equality-test chain that Reactor puts after the
+        /// switch (its default dispatcher).
+        /// </summary>
+        private static int RecoverReactorDispatcherTransitions(MethodDefinition method)
+        {
+            var body = method?.CilMethodBody;
+            if (body == null || body.ExceptionHandlers.Count != 0 || body.Instructions.Count < 4)
+                return 0;
+
+            var instructions = body.Instructions;
+            var changed = 0;
+
+            // Work on one dispatcher at a time.  The outer cleanup loop will revisit the
+            // method after unreachable blocks have disappeared.
+            for (var switchIndex = 1; switchIndex < instructions.Count; switchIndex++)
+            {
+                var switchInstruction = instructions[switchIndex];
+                if (switchInstruction.OpCode != CilOpCodes.Switch ||
+                    !TryGetSwitchTargets(switchInstruction.Operand, out var cases) ||
+                    cases.Count == 0)
+                {
+                    continue;
+                }
+
+                var loadIndex = PreviousNonNopIndex(instructions, switchIndex - 1);
+                if (loadIndex < 0 || !TryGetLdlocVariable(body, instructions[loadIndex], out var selector))
+                    continue;
+
+                var storeIndex = PreviousNonNopIndex(instructions, loadIndex - 1);
+                if (storeIndex < 0 ||
+                    !TryGetStlocVariable(body, instructions[storeIndex], out var storedSelector) ||
+                    !ReferenceEquals(selector, storedSelector))
+                {
+                    continue;
+                }
+
+                var storeInstruction = instructions[storeIndex];
+                var branchRewrites = new List<Tuple<CilInstruction, CilInstruction, CilInstruction>>();
+                var allStoreIncomingRecognized = true;
+
+                foreach (var branch in instructions)
+                {
+                    if (!IsUnconditionalBranch(branch.OpCode) ||
+                        !TryGetBranchTarget(branch.Operand, out var branchTarget) ||
+                        (!ReferenceEquals(branchTarget, storeInstruction) &&
+                         !ReferenceEquals(branchTarget, switchInstruction)))
+                    {
+                        continue;
+                    }
+
+                    var branchIndex = instructions.IndexOf(branch);
+                    var constantIndex = PreviousNonNopIndex(instructions, branchIndex - 1);
+                    if (constantIndex < 0 ||
+                        !TryGetConstInt32(instructions[constantIndex], out var state) ||
+                        !OnlyNopsBetween(instructions, constantIndex, branchIndex))
+                    {
+                        if (ReferenceEquals(branchTarget, storeInstruction))
+                            allStoreIncomingRecognized = false;
+                        continue;
+                    }
+
+                    var destination = ResolveReactorDispatcherTarget(
+                        body, switchIndex, selector, cases, state);
+                    if (destination == null ||
+                        ReferenceEquals(destination, storeInstruction) ||
+                        ReferenceEquals(destination, instructions[loadIndex]) ||
+                        ReferenceEquals(destination, switchInstruction))
+                    {
+                        if (ReferenceEquals(branchTarget, storeInstruction))
+                            allStoreIncomingRecognized = false;
+                        continue;
+                    }
+
+                    branchRewrites.Add(Tuple.Create(instructions[constantIndex], branch, destination));
+                }
+
+                // Entry fallthrough: ldc state; stloc selector; ldloc selector; switch.
+                var entryConstantIndex = PreviousNonNopIndex(instructions, storeIndex - 1);
+                CilInstruction entryDestination = null;
+                if (entryConstantIndex >= 0 &&
+                    TryGetConstInt32(instructions[entryConstantIndex], out var entryState) &&
+                    OnlyNopsBetween(instructions, entryConstantIndex, storeIndex))
+                {
+                    entryDestination = ResolveReactorDispatcherTarget(
+                        body, switchIndex, selector, cases, entryState);
+                }
+
+                // Replacing the shared store is safe only when every explicit incoming
+                // edge was understood and redirected.
+                if (entryDestination == null || !allStoreIncomingRecognized)
+                    continue;
+
+                var snapshot = instructions
+                    .Select(instruction => Tuple.Create(instruction, instruction.OpCode, instruction.Operand))
+                    .ToList();
+
+                foreach (var rewrite in branchRewrites)
+                {
+                    MakeNop(rewrite.Item1);
+                    rewrite.Item2.OpCode = CilOpCodes.Br;
+                    rewrite.Item2.Operand = new CilInstructionLabel(rewrite.Item3);
+                    changed += 2;
+                }
+
+                MakeNop(instructions[entryConstantIndex]);
+                storeInstruction.OpCode = CilOpCodes.Br;
+                storeInstruction.Operand = new CilInstructionLabel(entryDestination);
+                changed += 2;
+
+                // Reactor can carry a non-selector payload underneath the state value.
+                // Keep the reconstruction only when both independent stack analyses say
+                // it did not make the method less verifiable.
+                if (!HasValidStack(body))
+                {
+                    foreach (var item in snapshot)
+                    {
+                        item.Item1.OpCode = item.Item2;
+                        item.Item1.Operand = item.Item3;
+                    }
+                    return 0;
+                }
+                return changed;
+            }
+
+            return changed;
+        }
+
+        /// <summary>
+        /// Finishes a dispatcher after its shared state store was removed. At that
+        /// point the remaining real edges commonly use ldc.i4 state; br switch.
+        /// </summary>
+        private static int RecoverDirectReactorSwitchTransitions(MethodDefinition method)
+        {
+            var body = method?.CilMethodBody;
+            if (body == null || body.ExceptionHandlers.Count != 0 || body.Instructions.Count < 3)
+                return 0;
+
+            var instructions = body.Instructions;
+            for (var switchIndex = 1; switchIndex < instructions.Count; switchIndex++)
+            {
+                var switchInstruction = instructions[switchIndex];
+                if (switchInstruction.OpCode != CilOpCodes.Switch ||
+                    !TryGetSwitchTargets(switchInstruction.Operand, out var cases) ||
+                    cases.Count == 0)
+                {
+                    continue;
+                }
+
+                var loadIndex = PreviousNonNopIndex(instructions, switchIndex - 1);
+                if (loadIndex < 0 || !TryGetLdlocVariable(body, instructions[loadIndex], out var selector))
+                    continue;
+
+                var rewrites = new List<Tuple<CilInstruction, CilInstruction, CilInstruction>>();
+                foreach (var branch in instructions)
+                {
+                    if (!IsUnconditionalBranch(branch.OpCode) ||
+                        !TryGetBranchTarget(branch.Operand, out var target) ||
+                        !ReferenceEquals(target, switchInstruction))
+                    {
+                        continue;
+                    }
+
+                    var branchIndex = instructions.IndexOf(branch);
+                    var constantIndex = PreviousNonNopIndex(instructions, branchIndex - 1);
+                    if (constantIndex < 0 ||
+                        !TryGetConstInt32(instructions[constantIndex], out var state) ||
+                        !OnlyNopsBetween(instructions, constantIndex, branchIndex))
+                    {
+                        continue;
+                    }
+
+                    var destination = ResolveReactorDispatcherTarget(
+                        body, switchIndex, selector, cases, state);
+                    if (destination != null &&
+                        !ReferenceEquals(destination, instructions[loadIndex]) &&
+                        !ReferenceEquals(destination, switchInstruction))
+                    {
+                        rewrites.Add(Tuple.Create(instructions[constantIndex], branch, destination));
+                    }
+                }
+
+                if (rewrites.Count == 0)
+                    continue;
+
+                var snapshot = instructions
+                    .Select(instruction => Tuple.Create(instruction, instruction.OpCode, instruction.Operand))
+                    .ToList();
+                foreach (var rewrite in rewrites)
+                {
+                    MakeNop(rewrite.Item1);
+                    rewrite.Item2.OpCode = CilOpCodes.Br;
+                    rewrite.Item2.Operand = new CilInstructionLabel(rewrite.Item3);
+                }
+
+                if (!HasValidStack(body))
+                {
+                    foreach (var item in snapshot)
+                    {
+                        item.Item1.OpCode = item.Item2;
+                        item.Item1.Operand = item.Item3;
+                    }
+                    continue;
+                }
+
+                return rewrites.Count * 2;
+            }
+
+            return 0;
+        }
+
+        private static bool HasValidStack(CilMethodBody body)
+        {
+            try
+            {
+                body.VerifyLabels(calculateOffsets: true);
+                body.ComputeMaxStack(calculateOffsets: false);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static CilInstruction ResolveReactorDispatcherTarget(
+            CilMethodBody body,
+            int switchIndex,
+            CilLocalVariable selector,
+            IReadOnlyList<CilInstruction> cases,
+            int state)
+        {
+            if (state >= 0 && state < cases.Count)
+                return FollowBranchChain(cases[state]) ?? cases[state];
+
+            var instructions = body.Instructions;
+            var index = switchIndex + 1;
+            var visited = new HashSet<int>();
+            while (index >= 0 && index < instructions.Count && visited.Add(index))
+            {
+                index = NextNonNopIndex(instructions, index);
+                if (index < 0)
+                    return null;
+
+                var current = instructions[index];
+                if (IsUnconditionalBranch(current.OpCode) &&
+                    TryGetBranchTarget(current.Operand, out var direct))
+                {
+                    return FollowBranchChain(direct) ?? direct;
+                }
+
+                if (!TryGetLdlocVariable(body, current, out var loaded) ||
+                    !ReferenceEquals(loaded, selector))
+                {
+                    return null;
+                }
+
+                var constantIndex = NextNonNopIndex(instructions, index + 1);
+                var branchIndex = constantIndex < 0
+                    ? -1
+                    : NextNonNopIndex(instructions, constantIndex + 1);
+                if (constantIndex < 0 || branchIndex < 0 ||
+                    !TryGetConstInt32(instructions[constantIndex], out var compared) ||
+                    !TryGetBranchTarget(instructions[branchIndex].Operand, out var target))
+                {
+                    return null;
+                }
+
+                var code = instructions[branchIndex].OpCode.Code;
+                var isEqualBranch = code == CilCode.Beq || code == CilCode.Beq_S;
+                var isNotEqualBranch = code == CilCode.Bne_Un || code == CilCode.Bne_Un_S;
+                if (!isEqualBranch && !isNotEqualBranch)
+                    return null;
+
+                var taken = isEqualBranch ? state == compared : state != compared;
+                if (taken)
+                    return FollowBranchChain(target) ?? target;
+
+                index = branchIndex + 1;
+            }
+
+            return null;
+        }
+
+        private static int PreviousNonNopIndex(CilInstructionCollection instructions, int index)
+        {
+            while (index >= 0 && instructions[index].OpCode == CilOpCodes.Nop)
+                index--;
+            return index;
+        }
+
+        private static int NextNonNopIndex(CilInstructionCollection instructions, int index)
+        {
+            while (index < instructions.Count && instructions[index].OpCode == CilOpCodes.Nop)
+                index++;
+            return index < instructions.Count ? index : -1;
+        }
+
+        private static bool OnlyNopsBetween(CilInstructionCollection instructions, int first, int second)
+        {
+            for (var i = first + 1; i < second; i++)
+            {
+                if (instructions[i].OpCode != CilOpCodes.Nop)
+                    return false;
+            }
+            return true;
+        }
+
+        private static Dictionary<FieldDefinition, int> DiscoverReactorFieldConstants(ModuleDefinition module)
+        {
+            var result = new Dictionary<FieldDefinition, int>();
+            if (module == null)
+                return result;
+
+            foreach (var method in module.GetAllTypes().SelectMany(type => type.Methods))
+            {
+                var body = method?.CilMethodBody;
+                if (body == null || body.ExceptionHandlers.Count > 0 || body.Instructions.Count < 4)
+                    continue;
+
+                var instructions = body.Instructions;
+                for (var i = 1; i < instructions.Count; i++)
+                {
+                    if (instructions[i].OpCode != CilOpCodes.Stfld ||
+                        !(instructions[i].Operand is IFieldDescriptor targetDescriptor))
+                    {
+                        continue;
+                    }
+
+                    var target = targetDescriptor.Resolve() as FieldDefinition;
+                    if (target == null ||
+                        !string.Equals(target.Signature?.FieldType?.FullName, "System.Int32", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    var objectLoadIndex = i - 1;
+                    while (objectLoadIndex >= 0 &&
+                           instructions[objectLoadIndex].OpCode != CilOpCodes.Ldsfld &&
+                           instructions[objectLoadIndex].OpCode != CilOpCodes.Stfld &&
+                           instructions[objectLoadIndex].OpCode != CilOpCodes.Stsfld &&
+                           !IsTerminal(instructions[objectLoadIndex].OpCode))
+                    {
+                        objectLoadIndex--;
+                    }
+
+                    if (objectLoadIndex < 0 || instructions[objectLoadIndex].OpCode != CilOpCodes.Ldsfld)
+                        continue;
+                    if (!TryEvaluateInt32Expression(instructions, objectLoadIndex + 1, i - 1, out var value))
+                        continue;
+
+                    result[target] = value;
+                }
+            }
+
+            return result;
+        }
+
+        private static bool TryEvaluateInt32Expression(
+            CilInstructionCollection instructions,
+            int start,
+            int end,
+            out int value)
+        {
+            value = 0;
+            if (instructions == null || start < 0 || end < start || end >= instructions.Count)
+                return false;
+
+            var stack = new Stack<int>();
+            for (var i = start; i <= end; i++)
+            {
+                var instruction = instructions[i];
+                if (TryGetConstInt32(instruction, out var constant))
+                {
+                    stack.Push(constant);
+                    continue;
+                }
+
+                unchecked
+                {
+                    switch (instruction.OpCode.Code)
+                    {
+                        case CilCode.Neg:
+                            if (stack.Count < 1) return false;
+                            stack.Push(-stack.Pop());
+                            break;
+                        case CilCode.Not:
+                            if (stack.Count < 1) return false;
+                            stack.Push(~stack.Pop());
+                            break;
+                        case CilCode.Add:
+                        case CilCode.Sub:
+                        case CilCode.Mul:
+                        case CilCode.Xor:
+                        case CilCode.And:
+                        case CilCode.Or:
+                        case CilCode.Shl:
+                        case CilCode.Shr:
+                        case CilCode.Shr_Un:
+                            if (stack.Count < 2) return false;
+                            var right = stack.Pop();
+                            var left = stack.Pop();
+                            switch (instruction.OpCode.Code)
+                            {
+                                case CilCode.Add: stack.Push(left + right); break;
+                                case CilCode.Sub: stack.Push(left - right); break;
+                                case CilCode.Mul: stack.Push(left * right); break;
+                                case CilCode.Xor: stack.Push(left ^ right); break;
+                                case CilCode.And: stack.Push(left & right); break;
+                                case CilCode.Or: stack.Push(left | right); break;
+                                case CilCode.Shl: stack.Push(left << (right & 31)); break;
+                                case CilCode.Shr: stack.Push(left >> (right & 31)); break;
+                                case CilCode.Shr_Un: stack.Push((int)((uint)left >> (right & 31))); break;
+                            }
+                            break;
+                        default:
+                            return false;
+                    }
+                }
+            }
+
+            if (stack.Count != 1)
+                return false;
+            value = stack.Pop();
+            return true;
+        }
+
+        private static int InlineKnownReactorFieldConstants(
+            CilMethodBody body,
+            IReadOnlyDictionary<FieldDefinition, int> constants)
+        {
+            if (body?.Instructions == null || body.Instructions.Count < 2 || constants == null || constants.Count == 0)
+                return 0;
+
+            var targeted = BuildTargetedInstructionSet(body);
+            var instructions = body.Instructions;
+            var changed = 0;
+            for (var i = 1; i < instructions.Count; i++)
+            {
+                var fieldLoad = instructions[i];
+                if (fieldLoad.OpCode != CilOpCodes.Ldfld ||
+                    !(fieldLoad.Operand is IFieldDescriptor descriptor) ||
+                    !(descriptor.Resolve() is FieldDefinition field) ||
+                    !constants.TryGetValue(field, out var value))
+                {
+                    continue;
+                }
+
+                var instanceLoad = instructions[i - 1];
+                if (instanceLoad.OpCode != CilOpCodes.Ldsfld || targeted.Contains(fieldLoad))
+                    continue;
+
+                MakeNop(instanceLoad);
+                fieldLoad.OpCode = CilOpCodes.Ldc_I4;
+                fieldLoad.Operand = value;
+                changed++;
+            }
+
+            return changed;
         }
 
         /// <summary>
@@ -284,6 +840,7 @@ namespace Krypton.Pipeline.Stages
         {
             var instr = body.Instructions;
             var changed = 0;
+            var targeted = BuildTargetedInstructionSet(body);
 
             for (int i = 0; i < instr.Count; i++)
             {
@@ -297,7 +854,8 @@ namespace Krypton.Pipeline.Stages
                     var cmpIns = instr[i + 2];
                     var brIns  = instr[i + 3];
                     int? cmpResult = EvalCompare(cmpIns.OpCode.Code, v4L, v4R);
-                    if (cmpResult.HasValue && TryEvalBranch1(cmpResult.Value, brIns, out var taken4, out var tgt4))
+                    if (!HasTargetedInterior(instr, targeted, i, i + 3) &&
+                        cmpResult.HasValue && TryEvalBranch1(cmpResult.Value, brIns, out var taken4, out var tgt4))
                     {
                         FoldNop(instr, i); FoldNop(instr, i + 1); FoldNop(instr, i + 2);
                         FoldConditional(brIns, taken4, tgt4);
@@ -313,7 +871,8 @@ namespace Krypton.Pipeline.Stages
                     TryGetConstInt32(instr[i + 1], out var vR))
                 {
                     var brIns = instr[i + 2];
-                    if (TryEvalBranch2(vL, vR, brIns, out var taken3, out var tgt3))
+                    if (!HasTargetedInterior(instr, targeted, i, i + 2) &&
+                        TryEvalBranch2(vL, vR, brIns, out var taken3, out var tgt3))
                     {
                         FoldNop(instr, i); FoldNop(instr, i + 1);
                         FoldConditional(brIns, taken3, tgt3);
@@ -327,7 +886,8 @@ namespace Krypton.Pipeline.Stages
                 if (i + 1 < instr.Count && TryGetConstInt32(ins0, out var v1))
                 {
                     var brIns = instr[i + 1];
-                    if (TryEvalBranch1(v1, brIns, out var taken2, out var tgt2))
+                    if (!HasTargetedInterior(instr, targeted, i, i + 1) &&
+                        TryEvalBranch1(v1, brIns, out var taken2, out var tgt2))
                     {
                         FoldNop(instr, i);
                         FoldConditional(brIns, taken2, tgt2);
@@ -342,7 +902,8 @@ namespace Krypton.Pipeline.Stages
                 {
                     var brIns = instr[i + 1];
                     // ldnull == null → brfalse always taken, brtrue never taken
-                    if (TryEvalBranch1(0, brIns, out var takenN, out var tgtN))
+                    if (!HasTargetedInterior(instr, targeted, i, i + 1) &&
+                        TryEvalBranch1(0, brIns, out var takenN, out var tgtN))
                     {
                         FoldNop(instr, i);
                         FoldConditional(brIns, takenN, tgtN);
@@ -356,13 +917,14 @@ namespace Krypton.Pipeline.Stages
                 if (i + 1 < instr.Count &&
                     TryGetConstInt32(ins0, out var vSw) &&
                     instr[i + 1].OpCode == CilOpCodes.Switch &&
-                    instr[i + 1].Operand is IList<CilInstruction> swTargets)
+                    TryGetSwitchTargets(instr[i + 1].Operand, out var swTargets) &&
+                    !HasTargetedInterior(instr, targeted, i, i + 1))
                 {
                     FoldNop(instr, i);
                     if (vSw >= 0 && vSw < swTargets.Count)
                     {
                         instr[i + 1].OpCode = CilOpCodes.Br;
-                        instr[i + 1].Operand = swTargets[vSw];
+                        instr[i + 1].Operand = new CilInstructionLabel(swTargets[vSw]);
                     }
                     else
                     {
@@ -377,11 +939,25 @@ namespace Krypton.Pipeline.Stages
             return changed;
         }
 
+        private static bool HasTargetedInterior(
+            CilInstructionCollection instructions,
+            ISet<CilInstruction> targeted,
+            int start,
+            int end)
+        {
+            for (var i = start + 1; i <= end; i++)
+            {
+                if (targeted.Contains(instructions[i]))
+                    return true;
+            }
+            return false;
+        }
+
         private static bool TryEvalBranch1(int val, CilInstruction brIns, out bool taken, out CilInstruction target)
         {
             taken = false;
             target = null;
-            if (!(brIns.Operand is CilInstruction t))
+            if (!TryGetBranchTarget(brIns.Operand, out var t))
                 return false;
             target = t;
             var code = brIns.OpCode.Code;
@@ -394,7 +970,7 @@ namespace Krypton.Pipeline.Stages
         {
             taken = false;
             target = null;
-            if (!(brIns.Operand is CilInstruction t))
+            if (!TryGetBranchTarget(brIns.Operand, out var t))
                 return false;
             target = t;
             var code = brIns.OpCode.Code;
@@ -460,13 +1036,54 @@ namespace Krypton.Pipeline.Stages
             if (taken)
             {
                 brIns.OpCode = CilOpCodes.Br;
-                brIns.Operand = target;
+                brIns.Operand = new CilInstructionLabel(target);
             }
             else
             {
                 brIns.OpCode = CilOpCodes.Nop;
                 brIns.Operand = null;
             }
+        }
+
+        private static bool TryGetBranchTarget(object operand, out CilInstruction target)
+        {
+            target = operand as CilInstruction;
+            if (target != null)
+                return true;
+            target = (operand as CilInstructionLabel)?.Instruction;
+            return target != null;
+        }
+
+        private static bool TryGetSwitchTargets(object operand, out List<CilInstruction> targets)
+        {
+            targets = new List<CilInstruction>();
+            if (operand is IList<CilInstruction> rawTargets)
+            {
+                targets.AddRange(rawTargets);
+                return targets.Count > 0 && targets.All(target => target != null);
+            }
+
+            if (!(operand is IList<ICilLabel> labels))
+                return false;
+            foreach (var label in labels)
+            {
+                var target = (label as CilInstructionLabel)?.Instruction;
+                if (target == null)
+                    return false;
+                targets.Add(target);
+            }
+            return targets.Count > 0;
+        }
+
+        private static void SetSwitchTarget(CilInstruction switchInstruction, int index, CilInstruction target)
+        {
+            if (switchInstruction?.Operand is IList<CilInstruction> rawTargets)
+            {
+                rawTargets[index] = target;
+                return;
+            }
+            if (switchInstruction?.Operand is IList<ICilLabel> labels)
+                labels[index] = new CilInstructionLabel(target);
         }
 
         private static int ThreadBranchTargets(CilMethodBody body)
@@ -478,23 +1095,23 @@ namespace Krypton.Pipeline.Stages
 
             foreach (var ins in instructions)
             {
-                if (ins.Operand is CilInstruction target)
+                if (TryGetBranchTarget(ins.Operand, out var target))
                 {
                     var rewritten = FollowBranchChain(target);
                     if (rewritten != null && !ReferenceEquals(rewritten, target))
                     {
-                        ins.Operand = rewritten;
+                        ins.Operand = new CilInstructionLabel(rewritten);
                         changed++;
                     }
                 }
-                else if (ins.Operand is IList<CilInstruction> targets)
+                else if (TryGetSwitchTargets(ins.Operand, out var targets))
                 {
                     for (int i = 0; i < targets.Count; i++)
                     {
                         var rewritten = FollowBranchChain(targets[i]);
                         if (rewritten != null && !ReferenceEquals(rewritten, targets[i]))
                         {
-                            targets[i] = rewritten;
+                            SetSwitchTarget(ins, i, rewritten);
                             changed++;
                         }
                     }
@@ -514,7 +1131,7 @@ namespace Krypton.Pipeline.Stages
             for (int i = 0; i < instructions.Count; i++)
             {
                 var ins = instructions[i];
-                if (ins.OpCode != CilOpCodes.Switch || !(ins.Operand is IList<CilInstruction> rawTargets) || rawTargets.Count == 0)
+                if (ins.OpCode != CilOpCodes.Switch || !TryGetSwitchTargets(ins.Operand, out var rawTargets) || rawTargets.Count == 0)
                     continue;
 
                 var normalized = new List<CilInstruction>(rawTargets.Count);
@@ -538,7 +1155,7 @@ namespace Krypton.Pipeline.Stages
                 // switch pops selector; preserve stack by replacing with pop + br target.
                 ins.OpCode = CilOpCodes.Pop;
                 ins.Operand = null;
-                instructions.Insert(i + 1, new CilInstruction(CilOpCodes.Br, first));
+                instructions.Insert(i + 1, new CilInstruction(CilOpCodes.Br, new CilInstructionLabel(first)));
                 changed += 2;
                 i++;
             }
@@ -552,11 +1169,11 @@ namespace Krypton.Pipeline.Stages
                 return null;
 
             var current = target;
-            var visited = new HashSet<CilInstruction>();
+            var visited = new HashSet<CilInstruction>(ReferenceEqualityComparer.Instance);
             while (current != null && visited.Add(current))
             {
                 if ((current.OpCode == CilOpCodes.Br || current.OpCode == CilOpCodes.Br_S) &&
-                    current.Operand is CilInstruction next)
+                    TryGetBranchTarget(current.Operand, out var next))
                 {
                     current = next;
                     continue;
@@ -1283,17 +1900,17 @@ namespace Krypton.Pipeline.Stages
 
         private static HashSet<CilInstruction> BuildTargetedInstructionSet(CilMethodBody body)
         {
-            var targeted = new HashSet<CilInstruction>();
+            var targeted = new HashSet<CilInstruction>(ReferenceEqualityComparer.Instance);
             if (body == null)
                 return targeted;
 
             foreach (var instruction in body.Instructions)
             {
-                if (instruction.Operand is CilInstruction target)
+                if (TryGetBranchTarget(instruction.Operand, out var target))
                 {
                     targeted.Add(target);
                 }
-                else if (instruction.Operand is IList<CilInstruction> targets)
+                else if (TryGetSwitchTargets(instruction.Operand, out var targets))
                 {
                     foreach (var t in targets)
                     {
@@ -2536,10 +3153,16 @@ namespace Krypton.Pipeline.Stages
 
         private static HashSet<CilInstruction> ComputeReachableInstructions(CilMethodBody body)
         {
-            var reachable = new HashSet<CilInstruction>();
+            var reachable = new HashSet<CilInstruction>(ReferenceEqualityComparer.Instance);
             var instr = body.Instructions;
             if (instr.Count == 0)
                 return reachable;
+
+            var indexByInstruction = new Dictionary<CilInstruction, int>(
+                instr.Count,
+                ReferenceEqualityComparer.Instance);
+            for (var i = 0; i < instr.Count; i++)
+                indexByInstruction[instr[i]] = i;
 
             var work = new Stack<CilInstruction>();
             void Enqueue(CilInstruction i)
@@ -2564,17 +3187,16 @@ namespace Krypton.Pipeline.Stages
             while (work.Count > 0)
             {
                 var current = work.Pop();
-                var index = instr.IndexOf(current);
-                if (index < 0)
+                if (!indexByInstruction.TryGetValue(current, out var index))
                     continue;
 
                 var next = index + 1 < instr.Count ? instr[index + 1] : null;
                 var op = current.OpCode;
 
                 // Branch targets.
-                if (current.Operand is CilInstruction target)
+                if (TryGetBranchTarget(current.Operand, out var target))
                     Enqueue(target);
-                else if (current.Operand is IList<CilInstruction> targets)
+                else if (TryGetSwitchTargets(current.Operand, out var targets))
                 {
                     foreach (var t in targets)
                         Enqueue(t);

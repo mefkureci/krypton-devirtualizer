@@ -33,14 +33,15 @@ namespace Krypton.Pipeline.Stages
                 }
             }
 
-            var unaryCandidates = new[]
-            {
-                VMOpCode.Not,
-                VMOpCode.Neg,
-                VMOpCode.Conv_I4,
-                VMOpCode.Conv_I8,
-                VMOpCode.Conv_U1
-            };
+            var unaryCandidates = VMOpCodeCatalog.CandidateUniverse
+                .Where(op =>
+                {
+                    var semantic = VMOpCodeCatalog.Get(op);
+                    return semantic.Pop == 1 && semantic.Push == 1 &&
+                           (VMOpCodeCatalog.IsConversion(op) ||
+                            VMOpCodeCatalog.IsArithmetic(op));
+                })
+                .ToArray();
 
             var retuned = 0;
             var maxVmByte = Math.Min(_addressableOpcodeCount, ctx.Parser.Operands.Length);
@@ -111,11 +112,10 @@ namespace Krypton.Pipeline.Stages
 
         private bool IsBinaryArithmeticOpcode(VMOpCode opCode)
         {
-            return opCode == VMOpCode.Add ||
-                   opCode == VMOpCode.Sub ||
-                   opCode == VMOpCode.Xor ||
-                   opCode == VMOpCode.Shl ||
-                   opCode == VMOpCode.Shr;
+            if (!VMOpCodeCatalog.IsArithmetic(opCode))
+                return false;
+            var semantic = VMOpCodeCatalog.Get(opCode);
+            return semantic.Pop == 2 && semantic.Push == 1;
         }
 
         private void RetuneSuspiciousUnaryMappingsByBinaryContext(DevirtualizationCtx ctx)
@@ -138,17 +138,21 @@ namespace Krypton.Pipeline.Stages
                 }
             }
 
-            var binaryCandidates = new[] { VMOpCode.Add, VMOpCode.Sub, VMOpCode.Xor, VMOpCode.Shl, VMOpCode.Shr };
-            var suspiciousUnary = new HashSet<VMOpCode>
+            var binaryCandidates = VMOpCodeCatalog.CandidateUniverse
+                .Where(IsBinaryArithmeticOpcode)
+                .ToArray();
+            var suspiciousUnary = new HashSet<VMOpCode>(
+                VMOpCodeCatalog.CandidateUniverse.Where(op =>
+                {
+                    var semantic = VMOpCodeCatalog.Get(op);
+                    return semantic.Pop == 1 && semantic.Push == 1 &&
+                           (VMOpCodeCatalog.IsConversion(op) ||
+                            VMOpCodeCatalog.IsArithmetic(op));
+                }))
             {
                 VMOpCode.Dup,
                 VMOpCode.Pop,
-                VMOpCode.Nop,
-                VMOpCode.Conv_I4,
-                VMOpCode.Conv_I8,
-                VMOpCode.Conv_U1,
-                VMOpCode.Not,
-                VMOpCode.Neg
+                VMOpCode.Nop
             };
 
             var retuned = 0;

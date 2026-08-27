@@ -108,6 +108,7 @@ namespace Krypton.Runner
                 case IField f:
                     e.OperandKind  = "field";
                     e.DeclType     = f.DeclaringType?.FullName;
+                    e.DeclAssembly = AssemblyNameOf(f.DeclaringType);
                     e.MemberName   = f.Name;
                     e.MemberSig    = f.FieldSig?.Type?.FullName;
                     break;
@@ -115,6 +116,7 @@ namespace Krypton.Runner
                 case ITypeDefOrRef t:
                     e.OperandKind  = "type";
                     e.DeclType     = t.FullName;
+                    e.DeclAssembly = AssemblyNameOf(t);
                     break;
 
                 case Instruction target:
@@ -133,10 +135,70 @@ namespace Krypton.Runner
             return e;
         }
 
+        // dnlib cannot always name the defining assembly of a type reference rebuilt
+        // from a DynamicMethod scope. When it cannot, the running process can: the
+        // assembly that actually declares the type is loaded, so it is asked directly.
+        // That is runtime evidence, not a namespace guess.
+        private static string AssemblyNameOf(ITypeDefOrRef type)
+        {
+            if (type == null)
+                return null;
+
+            var declared = type.DefinitionAssembly?.Name;
+            if (!string.IsNullOrEmpty(declared))
+                return declared;
+
+            // A scope that names nothing must not end the search: returning its empty
+            // name here is what left framework types without a declaring assembly and
+            // pushed the consumer into guessing one from the namespace.
+            var scope = type.Scope;
+            while (scope != null)
+            {
+                if (scope is AssemblyRef assemblyRef)
+                {
+                    if (!string.IsNullOrEmpty(assemblyRef.Name))
+                        return assemblyRef.Name;
+                    break;
+                }
+                if (scope is ModuleDef moduleDef)
+                {
+                    var moduleAssembly = moduleDef.Assembly?.Name;
+                    if (!string.IsNullOrEmpty(moduleAssembly))
+                        return moduleAssembly;
+                    break;
+                }
+                if (scope is TypeRef nested)
+                {
+                    scope = nested.Scope;
+                    continue;
+                }
+                break;
+            }
+
+            var fullName = type.FullName?.Replace('/', '+');
+            if (string.IsNullOrEmpty(fullName))
+                return null;
+
+            foreach (var loaded in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    if (loaded.GetType(fullName, false) != null)
+                        return loaded.GetName().Name;
+                }
+                catch
+                {
+                }
+            }
+
+            return null;
+        }
+
         private static void SerializeMethod(InstructionEntry e, IMethod m)
         {
             e.OperandKind = "method";
             e.DeclType    = m.DeclaringType?.FullName;
+            e.DeclAssembly = AssemblyNameOf(m.DeclaringType);
             e.MemberName  = m.Name;
 
             var ms = m.MethodSig;

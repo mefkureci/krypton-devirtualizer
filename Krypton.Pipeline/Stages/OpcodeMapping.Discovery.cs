@@ -1100,6 +1100,9 @@ namespace Krypton.Pipeline.Stages
 
         private void InferUnknownByNeighborContext(DevirtualizationCtx ctx)
         {
+            if (IsSoundModeEnabled())
+                return;
+
             var strict = IsStrictMappingMode();
             if (strict && !IsEnvironmentEnabled("KRYPTON_ENABLE_NEIGHBOR_CONTEXT_IN_STRICT"))
                 return;

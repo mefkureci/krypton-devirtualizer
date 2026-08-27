@@ -28,6 +28,17 @@ namespace Krypton.Core
         public IList<VMMethod> VirtualizedMethods { get; set; }
         public MethodDefinition OpcodeHandlerMethod { get; set; }
         public IDictionary<int, int> OpcodeHandlerIndices { get; set; }
+
+        // False when the dispatcher candidate failed validation. Every inference
+        // that reads the opcode handler must stay silent rather than emit
+        // high-confidence mappings derived from an unrelated method.
+        public bool HandlerEvidenceEnabled { get; set; } = true;
+        public string DispatcherValidationSummary { get; set; }
+
+        // Mappings proven from metadata signatures and payload operand encoding.
+        // These are independent of the opcode table, so circular inference is not
+        // allowed to overturn them however the surrounding bytes move.
+        public ISet<int> AnchoredOpcodes { get; } = new HashSet<int>();
         public IDictionary<int, OpcodeMappingConfidence> OpcodeConfidence { get; set; }
         public int ReplacedMethodCount { get; set; }
         public IResourceReader ResourceReader { get; set; }

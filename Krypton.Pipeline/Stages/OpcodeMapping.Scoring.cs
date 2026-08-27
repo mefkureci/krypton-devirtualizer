@@ -67,6 +67,9 @@ namespace Krypton.Pipeline.Stages
 
         private void InferUnknownByStackConsistency(DevirtualizationCtx ctx)
         {
+            if (IsSoundModeEnabled())
+                return;
+
             if (ctx?.Parser?.Reader == null || ctx.Parser.MethodKeys == null || ctx.Parser.Operands == null || ctx.PatternMatcher == null)
                 return;
 
@@ -172,6 +175,9 @@ namespace Krypton.Pipeline.Stages
 
         private void InferRareUnknownByWindowedStackConsistency(DevirtualizationCtx ctx)
         {
+            if (IsSoundModeEnabled())
+                return;
+
             if (IsStrictMappingMode() && !IsEnvironmentEnabled("KRYPTON_ENABLE_WINDOWED_STACK_IN_STRICT"))
                 return;
 
@@ -262,6 +268,9 @@ namespace Krypton.Pipeline.Stages
 
         private void InferRareUnknownByConsensus(DevirtualizationCtx ctx)
         {
+            if (IsSoundModeEnabled())
+                return;
+
             if (ctx?.Parser?.Reader == null || ctx.Parser.MethodKeys == null || ctx.Parser.Operands == null || ctx.PatternMatcher == null)
                 return;
 
@@ -362,6 +371,9 @@ namespace Krypton.Pipeline.Stages
 
         private void InferSmallUnknownSetByJointStackSearch(DevirtualizationCtx ctx)
         {
+            if (IsSoundModeEnabled())
+                return;
+
             if (ctx?.Parser?.Reader == null || ctx.Parser.MethodKeys == null || ctx.Parser.Operands == null || ctx.PatternMatcher == null)
                 return;
 
@@ -900,6 +912,7 @@ namespace Krypton.Pipeline.Stages
             {
                 case VMOpCode.Ldarg:
                 case VMOpCode.Ldloc:
+                case VMOpCode.Ldloca:
                 case VMOpCode.Ldc_I4:
                 case VMOpCode.Ldstr:
                 case VMOpCode.Ldnull:
@@ -924,11 +937,10 @@ namespace Krypton.Pipeline.Stages
 
         private bool IsBinaryStackOpcode(VMOpCode opcode)
         {
-            return opcode == VMOpCode.Add ||
-                   opcode == VMOpCode.Sub ||
-                   opcode == VMOpCode.Xor ||
-                   opcode == VMOpCode.Shl ||
-                   opcode == VMOpCode.Shr;
+            if (!VMOpCodeCatalog.IsArithmetic(opcode))
+                return false;
+            var semantic = VMOpCodeCatalog.Get(opcode);
+            return semantic.Pop == 2 && semantic.Push == 1;
         }
 
         private VMOpCode PickMostFrequentResolvedOpcode(
@@ -1034,128 +1046,12 @@ namespace Krypton.Pipeline.Stages
 
         private List<VMOpCode> GetStackConsistencyCandidates(byte operandType)
         {
-            switch (operandType)
-            {
-                case 0:
-                    return new List<VMOpCode>
-                    {
-                        VMOpCode.Nop,
-                        VMOpCode.Pop,
-                        VMOpCode.Dup,
-                        VMOpCode.EndFinally,
-                        VMOpCode.Conv_I4,
-                        VMOpCode.Conv_I8,
-                        VMOpCode.Conv_U1,
-                        VMOpCode.Not,
-                        VMOpCode.Neg,
-                        VMOpCode.Add,
-                        VMOpCode.Sub,
-                        VMOpCode.Xor,
-                        VMOpCode.Shl,
-                        VMOpCode.Shr
-                    };
-                case 1:
-                {
-                    var result = new List<VMOpCode>
-                    {
-                        VMOpCode.Ldloc,
-                        VMOpCode.Ldarg,
-                        VMOpCode.Ldc_I4,
-                        VMOpCode.Stloc,
-                        VMOpCode.Leave,
-                        VMOpCode.Br,
-                        VMOpCode.BrTrue,
-                        VMOpCode.BrFalse,
-                        VMOpCode.BrLessThan,
-                        VMOpCode.Ldfld,
-                        VMOpCode.Ldsfld,
-                        VMOpCode.Stfld,
-                        VMOpCode.Stsfld,
-                        VMOpCode.Call,
-                        VMOpCode.Callvirt,
-                        VMOpCode.Newobj,
-                        VMOpCode.Newarr,
-                        VMOpCode.Unbox_Any,
-                        VMOpCode.Ldelem_Ref,
-                        VMOpCode.Ldelem_U1,
-                        VMOpCode.Stelem_Ref,
-                        VMOpCode.Stelem_I1,
-                        VMOpCode.Ldobj,
-                        VMOpCode.Stobj,
-                        VMOpCode.Ldelema
-                    };
-                    if (_heuristicsProfile.AllowOperandType1PopInference)
-                        result.Add(VMOpCode.Pop);
-                    return result;
-                }
-                case 5:
-                    return new List<VMOpCode> { VMOpCode.Switch };
-                default:
-                    return new List<VMOpCode>();
-            }
+            return VMOpCodeCatalog.GetCandidates(operandType).ToList();
         }
 
         private List<VMOpCode> GetRareConsensusCandidates(byte operandType)
         {
-            switch (operandType)
-            {
-                case 0:
-                    return new List<VMOpCode>
-                    {
-                        VMOpCode.Nop,
-                        VMOpCode.Pop,
-                        VMOpCode.Dup,
-                        VMOpCode.EndFinally,
-                        VMOpCode.Conv_I4,
-                        VMOpCode.Conv_I8,
-                        VMOpCode.Conv_U1,
-                        VMOpCode.Not,
-                        VMOpCode.Neg,
-                        VMOpCode.Add,
-                        VMOpCode.Sub,
-                        VMOpCode.Xor,
-                        VMOpCode.Shl,
-                        VMOpCode.Shr
-                    };
-                case 1:
-                {
-                    var result = new List<VMOpCode>
-                    {
-                        VMOpCode.Ldloc,
-                        VMOpCode.Ldarg,
-                        VMOpCode.Ldc_I4,
-                        VMOpCode.Stloc,
-                        VMOpCode.Leave,
-                        VMOpCode.Br,
-                        VMOpCode.BrTrue,
-                        VMOpCode.BrFalse,
-                        VMOpCode.BrLessThan,
-                        VMOpCode.Ldfld,
-                        VMOpCode.Ldsfld,
-                        VMOpCode.Stfld,
-                        VMOpCode.Stsfld,
-                        VMOpCode.Call,
-                        VMOpCode.Callvirt,
-                        VMOpCode.Newobj,
-                        VMOpCode.Newarr,
-                        VMOpCode.Unbox_Any,
-                        VMOpCode.Ldelem_Ref,
-                        VMOpCode.Ldelem_U1,
-                        VMOpCode.Stelem_Ref,
-                        VMOpCode.Stelem_I1,
-                        VMOpCode.Ldobj,
-                        VMOpCode.Stobj,
-                        VMOpCode.Ldelema
-                    };
-                    if (_heuristicsProfile.AllowOperandType1PopInference)
-                        result.Add(VMOpCode.Pop);
-                    return result;
-                }
-                case 5:
-                    return new List<VMOpCode> { VMOpCode.Switch };
-                default:
-                    return new List<VMOpCode>();
-            }
+            return GetStackConsistencyCandidates(operandType);
         }
 
         private List<VMOpCode> BuildCandidatesForUnknownByte(
@@ -1172,14 +1068,13 @@ namespace Krypton.Pipeline.Stages
             // Strong branch-shape bytes (target-like operands, never local/arg-like)
             // are better resolved against branch candidates only.
             if (operandType == 1 && IsStrongBranchTargetByte(streams, vmByte))
-                return new List<VMOpCode>
+                return candidates.Where(candidate =>
                 {
-                    VMOpCode.Br,
-                    VMOpCode.BrTrue,
-                    VMOpCode.BrFalse,
-                    VMOpCode.BrLessThan,
-                    VMOpCode.Leave
-                };
+                    var flow = VMOpCodeCatalog.Get(candidate).Flow;
+                    return flow == VMFlowKind.UnconditionalBranch ||
+                           flow == VMFlowKind.ConditionalBranch ||
+                           flow == VMFlowKind.Leave;
+                }).ToList();
 
             return candidates;
         }
@@ -1201,7 +1096,16 @@ namespace Krypton.Pipeline.Stages
                         return false;
 
                     seen++;
-                    if (target >= stream.LocalCount && target >= stream.ArgCount)
+                    // A branch target is not necessarily a large instruction index.
+                    // Dispatcher-protected methods very often jump back to a small
+                    // control-flow hub (commonly instruction 1 or 3), which used to be
+                    // mistaken for a local/argument/constant operand.  A backward edge
+                    // or a non-local jump is strong control-flow evidence regardless of
+                    // the numeric value of the destination.
+                    var distance = target - i;
+                    if (target >= stream.LocalCount && target >= stream.ArgCount ||
+                        distance < 0 ||
+                        Math.Abs(distance) > 8)
                         branchLike++;
                 }
             }
@@ -1211,10 +1115,11 @@ namespace Krypton.Pipeline.Stages
 
         private bool IsBranchOpcode(VMOpCode opCode)
         {
-            return opCode == VMOpCode.Br ||
-                   opCode == VMOpCode.BrTrue ||
-                   opCode == VMOpCode.BrFalse ||
-                   opCode == VMOpCode.BrLessThan;
+            if (!VMOpCodeCatalog.TryGet(opCode, out var semantic))
+                return false;
+            return semantic.Flow == VMFlowKind.UnconditionalBranch ||
+                   semantic.Flow == VMFlowKind.ConditionalBranch ||
+                   semantic.Flow == VMFlowKind.Leave;
         }
 
         private int CountVmByteOccurrences(IReadOnlyList<VmMethodStreamSample> streams, int vmByte)
@@ -1298,23 +1203,36 @@ namespace Krypton.Pipeline.Stages
             pop = 0;
             push = 0;
 
+            if (VMOpCodeCatalog.TryGet(opCode, out var semantic) &&
+                semantic.HasFixedStackEffect)
+            {
+                pop = semantic.Pop;
+                push = semantic.Push;
+                return true;
+            }
+
             switch (opCode)
             {
                 case VMOpCode.Nop:
                     return true;
                 case VMOpCode.Ldarg:
                 case VMOpCode.Ldloc:
+                case VMOpCode.Ldloca:
                 case VMOpCode.Ldc_I4:
                 case VMOpCode.Ldstr:
                 case VMOpCode.Ldnull:
                 case VMOpCode.Ldsfld:
+                case VMOpCode.Ldsflda:
                 case VMOpCode.Newobj:
                     push = 1;
                     return true;
                 case VMOpCode.Ldfld:
+                case VMOpCode.Ldflda:
                 case VMOpCode.Ldlen:
                 case VMOpCode.Ldobj:
                 case VMOpCode.Unbox_Any:
+                case VMOpCode.Isinst:
+                case VMOpCode.Castclass:
                     pop = 1;
                     push = 1;
                     return true;
@@ -1411,6 +1329,9 @@ namespace Krypton.Pipeline.Stages
 
         private void InferRareOperand1BranchesByTargetAndNeighbors(DevirtualizationCtx ctx)
         {
+            if (IsSoundModeEnabled())
+                return;
+
             if (ctx?.Parser?.Reader == null || ctx.Parser.MethodKeys == null || ctx.Parser.Operands == null || ctx.PatternMatcher == null)
                 return;
 
@@ -1418,7 +1339,9 @@ namespace Krypton.Pipeline.Stages
             if (streams.Count == 0)
                 return;
 
-            var branchOpCodes = new[] { VMOpCode.Br, VMOpCode.BrTrue, VMOpCode.BrFalse, VMOpCode.BrLessThan };
+            var branchOpCodes = VMOpCodeCatalog.GetCandidates(1)
+                .Where(IsBranchOpcode)
+                .ToArray();
             var exactVotes = new Dictionary<BranchContextKey, Dictionary<VMOpCode, int>>();
             var sourceVotes = new Dictionary<SourceNeighborKey, Dictionary<VMOpCode, int>>();
             var targetVotes = new Dictionary<TargetNeighborKey, Dictionary<VMOpCode, int>>();

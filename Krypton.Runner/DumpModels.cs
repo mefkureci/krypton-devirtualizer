@@ -71,6 +71,11 @@ namespace Krypton.Runner
 
         // member-reference operands (method / field / type)
         public string DeclType { get; set; }    // declaring type full name
+        // Which assembly actually declares that type. Without it the consumer has
+        // to guess a scope from the namespace, and any type whose namespace does not
+        // match its assembly (System.Windows.Application lives in PresentationFramework)
+        // ends up referenced against the wrong assembly.
+        public string DeclAssembly { get; set; }
         public string MemberName { get; set; }
         public string MemberSig { get; set; }   // human-readable sig, e.g. "instance void (System.String)"
 

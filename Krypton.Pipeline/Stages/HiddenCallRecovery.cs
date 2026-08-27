@@ -3,8 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 using AsmResolver.DotNet;
+using AsmResolver.DotNet.Builder;
 using AsmResolver.DotNet.Code.Cil;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.DotNet.Signatures.Types;
@@ -33,6 +35,55 @@ namespace Krypton.Pipeline.Stages
     public sealed class HiddenCallRecovery : IStage
     {
         public string Name => "HiddenCallRecovery";
+
+        /// <summary>
+        /// Applies the same evidence-driven rewrite to a known-valid restored
+        /// assembly copy. This is used only as a write fallback when unrelated
+        /// malformed bootstrap methods prevent the main donor image from being
+        /// serialized; no new recovery logic is involved.
+        /// </summary>
+        public static int PatchAssemblyCopy(
+            string donorPath,
+            string outputPath,
+            string dumpPath,
+            out int siteCount,
+            Func<MethodDefinition, bool> methodFilter = null)
+        {
+            siteCount = 0;
+            if (string.IsNullOrWhiteSpace(donorPath) || !File.Exists(donorPath) ||
+                string.IsNullOrWhiteSpace(dumpPath) || !File.Exists(dumpPath))
+                return 0;
+
+            var module = ModuleDefinition.FromFile(donorPath);
+            var map = BuildCalleeMap(dumpPath, null);
+            if (map == null || map.Count == 0)
+                return 0;
+
+            var sites = new List<HiddenCallSiteResult>();
+            var patched = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    if (method.CilMethodBody == null ||
+                        (methodFilter != null && !methodFilter(method)))
+                        continue;
+                    patched += PatchMethod(method, map, module, sites);
+                }
+            }
+
+            module.Write(outputPath, new ManagedPEImageBuilder(new DotNetDirectoryFactory(
+                MetadataBuilderFlags.PreserveTypeDefinitionIndices |
+                MetadataBuilderFlags.PreserveFieldDefinitionIndices |
+                MetadataBuilderFlags.PreserveMethodDefinitionIndices |
+                MetadataBuilderFlags.PreserveParameterDefinitionIndices |
+                MetadataBuilderFlags.PreserveEventDefinitionIndices |
+                MetadataBuilderFlags.PreservePropertyDefinitionIndices |
+                MetadataBuilderFlags.PreserveMemberReferenceIndices |
+                MetadataBuilderFlags.NoStringsStreamOptimization)));
+            siteCount = sites.Count(s => s.Rewrite);
+            return patched;
+        }
 
         public void Run(DevirtualizationCtx ctx)
         {
@@ -89,13 +140,24 @@ namespace Krypton.Pipeline.Stages
 
             int patchedCalls   = 0;
             int patchedMethods = 0;
+            var siteResults = new List<HiddenCallSiteResult>();
 
             foreach (var type in ctx.Module.GetAllTypes())
             {
                 foreach (var method in type.Methods)
                 {
                     if (method.CilMethodBody == null) continue;
-                    int patched = PatchMethod(method, calleeMap, ctx.Module);
+                    int patched;
+                    try
+                    {
+                        patched = PatchMethod(method, calleeMap, ctx.Module, siteResults);
+                    }
+                    catch (Exception ex)
+                    {
+                        ctx.Options.Logger.Warning(
+                            $"[HCR] Patch failed in {method.FullName}: {ex.GetType().Name}: {ex.Message}");
+                        continue;
+                    }
                     if (patched > 0)
                     {
                         patchedCalls += patched;
@@ -106,6 +168,7 @@ namespace Krypton.Pipeline.Stages
 
             ctx.Options.Logger.Success(
                 $"[HCR] Recovered {patchedCalls} hidden call(s) in {patchedMethods} method(s).");
+            WriteSiteReport(originalPath, calleeMap, siteResults, ctx);
         }
 
         // ──────────────────────────────────────────────────────────────────────────
@@ -211,11 +274,45 @@ namespace Krypton.Pipeline.Stages
                     map[fieldToken] = callee;
                 }
 
+                // Capture order decides whether dnlib could name a type's assembly: an
+                // entry recorded before that assembly was loaded has none, while a later
+                // entry for the same type does. Fill the gaps from the evidence itself
+                // rather than guessing a scope from the namespace.
+                var assemblyByType = new Dictionary<string, string>(StringComparer.Ordinal);
+                foreach (var callee in map.Values)
+                {
+                    if (!string.IsNullOrWhiteSpace(callee.DeclaringType) &&
+                        !string.IsNullOrWhiteSpace(callee.DeclaringAssembly))
+                    {
+                        assemblyByType[callee.DeclaringType] = callee.DeclaringAssembly;
+                    }
+                }
+
+                var filled = 0;
+                foreach (var callee in map.Values)
+                {
+                    if (!string.IsNullOrWhiteSpace(callee.DeclaringAssembly))
+                        continue;
+                    if (callee.DeclaringType != null &&
+                        assemblyByType.TryGetValue(callee.DeclaringType, out var assemblyName))
+                    {
+                        callee.DeclaringAssembly = assemblyName;
+                        filled++;
+                    }
+                }
+
+                if (filled > 0 && ctx != null)
+                {
+                    ctx.Options.Logger.Info(
+                        $"[HCR] Completed the declaring assembly of {filled} callee(s) from other entries.");
+                }
+
                 return map;
             }
             catch (Exception ex)
             {
-                ctx.Options.Logger.Warning($"[HCR] Failed to parse dump: {ex.Message}");
+                if (ctx != null)
+                    ctx.Options.Logger.Warning($"[HCR] Failed to parse dump: {ex.Message}");
                 return null;
             }
         }
@@ -250,11 +347,15 @@ namespace Krypton.Pipeline.Stages
                 instr.TryGetProperty("DeclType",   out var declTypeProp);
                 instr.TryGetProperty("MemberName", out var memberNameProp);
                 instr.TryGetProperty("MemberSig",  out var memberSigProp);
+                instr.TryGetProperty("DeclAssembly", out var declAssemblyProp);
 
                 string opcode     = opcodeProp.GetString()     ?? string.Empty;
                 string declType   = declTypeProp.GetString()   ?? string.Empty;
                 string memberName = memberNameProp.GetString()  ?? string.Empty;
                 string memberSig  = memberSigProp.GetString()  ?? string.Empty;
+                string declAssembly = declAssemblyProp.ValueKind == JsonValueKind.String
+                    ? declAssemblyProp.GetString()
+                    : null;
 
                 // Skip delegate Invoke itself (we're looking for the real call inside the thunk)
                 if (string.Equals(memberName, "Invoke", StringComparison.Ordinal))
@@ -269,6 +370,7 @@ namespace Krypton.Pipeline.Stages
                     DeclaringType = declType,
                     MethodName    = memberName,
                     MemberSig     = memberSig,
+                    DeclaringAssembly = declAssembly,
                     ParamTypes    = paramTypes,
                     IsInstance    = memberSig.StartsWith("instance", StringComparison.Ordinal),
                 };
@@ -302,7 +404,8 @@ namespace Krypton.Pipeline.Stages
         private static int PatchMethod(
             MethodDefinition method,
             Dictionary<int, CalleeDescriptor> calleeMap,
-            ModuleDefinition module)
+            ModuleDefinition module,
+            ICollection<HiddenCallSiteResult> siteResults)
         {
             var body = method.CilMethodBody;
             var il   = body.Instructions;
@@ -316,35 +419,58 @@ namespace Krypton.Pipeline.Stages
                 if (fieldRef == null) continue;
 
                 int fieldToken = fieldRef.MetadataToken.ToInt32();
-                if (!calleeMap.TryGetValue(fieldToken, out var callee)) continue;
 
                 // Find the delegate dispatch call: named "Invoke" or with obfuscated name
                 // (NET Reactor renames Invoke to control chars that have no identifier chars).
-                int callIdx = FindDelegateCall(il, i + 1, out _);
+                int callIdx = FindDelegateCall(il, i + 1, fieldRef, out var pattern);
                 if (callIdx < 0) continue;
+
+                var site = new HiddenCallSiteResult
+                {
+                    Caller = method.FullName,
+                    IlOffset = il[i].Offset,
+                    DelegateField = $"0x{fieldToken:X8}",
+                    Pattern = pattern,
+                    Rewrite = false,
+                    SignatureCompatible = false
+                };
+                siteResults?.Add(site);
+
+                if (!calleeMap.TryGetValue(fieldToken, out var callee))
+                {
+                    site.CapturedTarget = "<missing>";
+                    continue;
+                }
+                site.CapturedTarget = $"{callee.DeclaringType}::{callee.MethodName}";
+
+                if (!IsCompatibleWrapperSignature(il[callIdx].Operand as IMethodDescriptor, fieldRef, callee))
+                    continue;
+                site.SignatureCompatible = true;
 
                 var replacement = BuildCallInstruction(callee, module);
                 if (replacement == null) continue;
 
-                // Correct patching:
+                // Patching, label-safe:
                 //   BEFORE: ldsfld <delegate>, [arg-loading...], callvirt Invoke
-                //   AFTER:  [arg-loading...],  callvirt/call  RealMethod
+                //   AFTER:  nop,               [arg-loading...], callvirt/call RealMethod
                 //
-                // Step 1 — replace the Invoke with the real call (index still valid)
-                il[callIdx] = replacement;
+                // Both edits mutate the existing instruction objects. Replacing an
+                // instruction object, or removing one, silently invalidates every
+                // CilInstructionLabel bound to it, and the module then fails to build
+                // with "references an instruction that is not present in the method
+                // body" - in a completely unrelated method whose branch happened to
+                // target it.
+                il[callIdx].OpCode = replacement.OpCode;
+                il[callIdx].Operand = replacement.Operand;
 
-                // Step 2 — remove the ldsfld; everything between shifts down by 1,
-                //           but that's fine since we already replaced what matters.
-                il.RemoveAt(i);
+                il[i].OpCode = CilOpCodes.Nop;
+                il[i].Operand = null;
 
-                // i now points to the first arg-loading instruction (was i+1).
-                // Decrement so the outer loop re-evaluates position i next iteration.
-                i--;
                 count++;
+                site.DirectReplacement = replacement.OpCode.Code + " " +
+                                        callee.DeclaringType + "::" + callee.MethodName;
+                site.Rewrite = true;
             }
-
-            if (count > 0)
-                body.Instructions.OptimizeMacros();
 
             return count;
         }
@@ -360,6 +486,7 @@ namespace Krypton.Pipeline.Stages
         private static int FindDelegateCall(
             CilInstructionCollection il,
             int start,
+            IFieldDescriptor delegateField,
             out string diagName)
         {
             diagName = null;
@@ -384,6 +511,12 @@ namespace Krypton.Pipeline.Stages
                         diagName = name.Length == 0 ? "<empty>" : isObfuscatedInvoke ? "<ctrlchars>" : "Invoke";
                         return i;
                     }
+
+                    if (IsDelegateWrapperCall(instr.Operand as IMethodDescriptor, delegateField))
+                    {
+                        diagName = "wrapper";
+                        return i;
+                    }
                 }
 
                 // Stop at unconditional control flow.
@@ -396,6 +529,84 @@ namespace Krypton.Pipeline.Stages
             return -1;
         }
 
+        private static bool IsDelegateWrapperCall(
+            IMethodDescriptor method,
+            IFieldDescriptor delegateField)
+        {
+            if (method?.Signature == null || delegateField == null)
+                return false;
+
+            var resolved = SafeResolve(method);
+            if (resolved != null && !resolved.IsStatic)
+                return false;
+
+            var fieldType = delegateField.Signature?.FieldType?.FullName ??
+                            delegateField.Resolve()?.Signature?.FieldType?.FullName;
+            if (string.IsNullOrWhiteSpace(fieldType) || method.Signature.ParameterTypes.Count == 0)
+                return false;
+
+            var last = method.Signature.ParameterTypes[method.Signature.ParameterTypes.Count - 1];
+            return string.Equals(last?.FullName, fieldType, StringComparison.Ordinal);
+        }
+
+        private static bool IsCompatibleWrapperSignature(
+            IMethodDescriptor wrapper,
+            IFieldDescriptor delegateField,
+            CalleeDescriptor callee)
+        {
+            if (!IsDelegateWrapperCall(wrapper, delegateField) || callee == null)
+                return false;
+
+            var wrapperParameters = wrapper.Signature.ParameterTypes.Count - 1;
+            var targetParameters = callee.ParamTypes.Count + (callee.IsInstance ? 1 : 0);
+            return wrapperParameters == targetParameters;
+        }
+
+        private static MethodDefinition SafeResolve(IMethodDescriptor method)
+        {
+            try { return method?.Resolve(); }
+            catch { return null; }
+        }
+
+        private static void WriteSiteReport(
+            string originalPath,
+            Dictionary<int, CalleeDescriptor> calleeMap,
+            IList<HiddenCallSiteResult> sites,
+            DevirtualizationCtx ctx)
+        {
+            try
+            {
+                var path = Path.ChangeExtension(originalPath, null) + "-hidden-call-report.txt";
+                var sb = new StringBuilder();
+                sb.AppendLine("Krypton HiddenCallRecovery report");
+                sb.AppendLine("================================");
+                sb.AppendLine($"captured dynamic targets: {calleeMap.Count}");
+                sb.AppendLine($"hidden-call sites: {sites.Count}");
+                sb.AppendLine($"rewritten: {sites.Count(s => s.Rewrite)}");
+                sb.AppendLine($"remaining: {sites.Count(s => !s.Rewrite)}");
+                sb.AppendLine($"unresolved targets: {sites.Count(s => s.CapturedTarget == "<missing>")}");
+                sb.AppendLine();
+                foreach (var site in sites)
+                {
+                    sb.AppendLine($"caller: {site.Caller}");
+                    sb.AppendLine($"IL offset: 0x{site.IlOffset:X4}");
+                    sb.AppendLine($"delegate field: {site.DelegateField}");
+                    sb.AppendLine($"pattern: {site.Pattern}");
+                    sb.AppendLine($"captured target: {site.CapturedTarget ?? "<none>"}");
+                    sb.AppendLine($"signature compatible: {(site.SignatureCompatible ? "YES" : "NO")}");
+                    sb.AppendLine($"direct replacement: {site.DirectReplacement ?? "<none>"}");
+                    sb.AppendLine($"rewrite: {(site.Rewrite ? "YES" : "NO")}");
+                    sb.AppendLine();
+                }
+                File.WriteAllText(path, sb.ToString());
+                ctx.Options.Logger.Info($"[HCR] Site report: {path}");
+            }
+            catch (Exception ex)
+            {
+                ctx.Options.Logger.Warning($"[HCR] Could not write site report: {ex.Message}");
+            }
+        }
+
 
         /// <summary>
         /// Builds the replacement CIL instruction that directly calls the real method.
@@ -406,7 +617,7 @@ namespace Krypton.Pipeline.Stages
         {
             try
             {
-                var scope     = FindOrAddAssemblyRef(callee.DeclaringType, module);
+                var scope     = ResolveScope(callee, callee.DeclaringType, module);
                 var ns        = GetNamespace(callee.DeclaringType);
                 var typeName  = GetTypeName(callee.DeclaringType);
 
@@ -418,7 +629,7 @@ namespace Krypton.Pipeline.Stages
                 if (callee.DeclaringType.Contains("/"))
                 {
                     var parts = callee.DeclaringType.Split('/');
-                    var outerScope = FindOrAddAssemblyRef(parts[0], module);
+                    var outerScope = ResolveScope(callee, parts[0], module);
                     var current = new TypeReference(module, outerScope, GetNamespace(parts[0]), GetTypeName(parts[0]));
                     for (int p = 1; p < parts.Length; p++)
                         current = new TypeReference(module, current, string.Empty, parts[p]);
@@ -458,6 +669,10 @@ namespace Krypton.Pipeline.Stages
             ModuleDefinition module)
         {
             var corLib = module.CorLibTypeFactory;
+            // Signatures built from parsed names carry freshly-constructed type
+            // references; importing them binds every reference into this module's
+            // context so the resulting MemberRef/TypeSpec is resolvable (an
+            // un-imported generic instance yields an unresolvable member token).
             var returnSig  = ParseTypeSig(ExtractReturnType(callee.MemberSig), module, corLib);
             var paramSigs  = callee.ParamTypes
                 .Select(p => ParseTypeSig(p, module, corLib))
@@ -470,6 +685,103 @@ namespace Krypton.Pipeline.Stages
                 return MethodSignature.CreateStatic(returnSig, paramSigs);
         }
 
+        // Splits "A,B<C,D>,E" on top-level commas only, respecting <> nesting.
+        private static List<string> SplitTopLevelCommas(string text)
+        {
+            var parts = new List<string>();
+            int depth = 0, start = 0;
+            for (int i = 0; i < text.Length; i++)
+            {
+                var c = text[i];
+                if (c == '<' || c == '[') depth++;
+                else if (c == '>' || c == ']') depth--;
+                else if (c == ',' && depth == 0)
+                {
+                    parts.Add(text.Substring(start, i - start));
+                    start = i + 1;
+                }
+            }
+            if (start <= text.Length) parts.Add(text.Substring(start));
+            return parts;
+        }
+
+        private static int IndexOfTopLevel(string text, char target)
+        {
+            int depth = 0;
+            for (int i = 0; i < text.Length; i++)
+            {
+                var c = text[i];
+                // Check for the target at the top level BEFORE adjusting depth, so a
+                // depth-delimiter character (e.g. '<') can itself be found at depth 0.
+                if (c == target && depth == 0) return i;
+                if (c == '<' || c == '[') depth++;
+                else if (c == '>' || c == ']') depth--;
+            }
+            return -1;
+        }
+
+        // Per-module cache of every generic-instance type signature already used in
+        // the image (return/parameter/field/local types), keyed by full name. Reusing
+        // one guarantees a signature blob the runtime already accepts.
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<
+            ModuleDefinition, Dictionary<string, TypeSignature>> GenericInstanceCache =
+            new System.Runtime.CompilerServices.ConditionalWeakTable<
+                ModuleDefinition, Dictionary<string, TypeSignature>>();
+
+        private static TypeSignature FindExistingGenericInstance(ModuleDefinition module, string fullName)
+        {
+            var map = GenericInstanceCache.GetValue(module, m =>
+            {
+                var d = new Dictionary<string, TypeSignature>(StringComparer.Ordinal);
+                void Consider(TypeSignature sig)
+                {
+                    if (sig is GenericInstanceTypeSignature gi && !d.ContainsKey(gi.FullName))
+                        d[gi.FullName] = gi;
+                }
+                foreach (var t in m.GetAllTypes())
+                {
+                    foreach (var method in t.Methods)
+                    {
+                        var sig = method.Signature;
+                        if (sig == null) continue;
+                        Consider(sig.ReturnType);
+                        foreach (var pt in sig.ParameterTypes) Consider(pt);
+                    }
+                    foreach (var f in t.Fields)
+                        if (f.Signature != null) Consider(f.Signature.FieldType);
+                }
+                return d;
+            });
+            return map.TryGetValue(fullName, out var found) ? found : null;
+        }
+
+        // Parses the reflection assembly-qualified generic form
+        // "Base`N[[Arg1, Asm, ...],[Arg2, Asm, ...]]" into the base name and the bare
+        // argument type names (assembly info dropped; recursion re-resolves each).
+        private static bool TryParseReflectionGeneric(string fullName, out string basePart, out List<string> args)
+        {
+            basePart = null; args = new List<string>();
+            int bb = fullName.IndexOf("[[", StringComparison.Ordinal);
+            if (bb <= 0 || !fullName.EndsWith("]", StringComparison.Ordinal)) return false;
+            basePart = fullName.Substring(0, bb);
+            if (basePart.IndexOf('`') < 0) return false;
+            var content = fullName.Substring(bb + 1, fullName.Length - bb - 2);
+            int depth = 0, start = -1;
+            for (int i = 0; i < content.Length; i++)
+            {
+                char c = content[i];
+                if (c == '[') { if (depth == 0) start = i + 1; depth++; }
+                else if (c == ']') { depth--; if (depth == 0 && start >= 0)
+                    {
+                        var aqn = content.Substring(start, i - start);
+                        int comma = IndexOfTopLevel(aqn, ',');
+                        args.Add((comma < 0 ? aqn : aqn.Substring(0, comma)).Trim());
+                        start = -1;
+                    } }
+            }
+            return args.Count > 0;
+        }
+
         private static TypeSignature ParseTypeSig(
             string fullName,
             ModuleDefinition module,
@@ -477,8 +789,18 @@ namespace Krypton.Pipeline.Stages
         {
             if (string.IsNullOrWhiteSpace(fullName)) return corLib.Object;
 
+            fullName = fullName.Trim();
+
             bool isByRef = fullName.EndsWith("&");
             if (isByRef) fullName = fullName.Substring(0, fullName.Length - 1).TrimEnd();
+
+            // Unmanaged pointer suffix.
+            if (fullName.EndsWith("*"))
+            {
+                var pointee = ParseTypeSig(fullName.Substring(0, fullName.Length - 1), module, corLib);
+                TypeSignature ptr = pointee != null ? new PointerTypeSignature(pointee) : (TypeSignature)corLib.Object;
+                return isByRef ? new ByReferenceTypeSignature(ptr) : ptr;
+            }
 
             // Strip array suffix and build SzArrayTypeSignature recursively.
             if (fullName.EndsWith("[]"))
@@ -488,20 +810,70 @@ namespace Krypton.Pipeline.Stages
                 return isByRef ? new ByReferenceTypeSignature(arr) : arr;
             }
 
+            // Generic instantiation: "Base`N<Arg1,Arg2,...>". dnlib FullName uses <>.
+            // Reconstruct a GenericInstanceTypeSignature over the open definition,
+            // recursing on each argument, rather than emitting a literal type name.
+            // Reflection assembly-qualified generic form (Base`N[[..],[..]]).
+            if (TryParseReflectionGeneric(fullName, out var rBase, out var rArgs))
+            {
+                var reusedR = FindExistingGenericInstance(module, fullName);
+                if (reusedR != null)
+                    return isByRef ? new ByReferenceTypeSignature(reusedR) : reusedR;
+                var rArgSigs = rArgs.Select(a => ParseTypeSig(a, module, corLib) ?? corLib.Object).ToArray();
+                var rGenDef = ResolveOrBuildTypeRef(rBase, module);
+                if (rGenDef != null)
+                {
+                    TypeSignature rgi;
+                    try { rgi = rGenDef.MakeGenericInstanceType(rArgSigs); }
+                    catch { rgi = new GenericInstanceTypeSignature(rGenDef, IsKnownValueType(rBase), rArgSigs); }
+                    return isByRef ? new ByReferenceTypeSignature(rgi) : rgi;
+                }
+            }
+
+            int lt = IndexOfTopLevel(fullName, '<');
+            if (lt > 0 && fullName.EndsWith(">"))
+            {
+                // Prefer an identical generic instance already present in the module:
+                // its signature blob was parsed from the original image and is
+                // guaranteed CLR-valid, sidestepping any subtle mismatch in a
+                // hand-built blob.
+                var reused = FindExistingGenericInstance(module, fullName);
+                if (reused != null)
+                    return isByRef ? new ByReferenceTypeSignature(reused) : reused;
+
+                var basePart = fullName.Substring(0, lt);
+                var argsPart = fullName.Substring(lt + 1, fullName.Length - lt - 2);
+                var argSigs = SplitTopLevelCommas(argsPart)
+                    .Select(a => ParseTypeSig(a.Trim(), module, corLib) ?? corLib.Object)
+                    .ToArray();
+                var genDef = ResolveOrBuildTypeRef(basePart, module);
+                if (genDef == null) return corLib.Object;
+                TypeSignature gi;
+                try { gi = genDef.MakeGenericInstanceType(argSigs); }
+                catch { gi = new GenericInstanceTypeSignature(genDef, IsKnownValueType(basePart), argSigs); }
+                return isByRef ? new ByReferenceTypeSignature(gi) : gi;
+            }
+
             TypeSignature inner = fullName switch
             {
                 "System.Void"    => corLib.Void,
                 "System.Boolean" => corLib.Boolean,
                 "System.Byte"    => corLib.Byte,
+                "System.SByte"   => corLib.SByte,
                 "System.Int16"   => corLib.Int16,
                 "System.Int32"   => corLib.Int32,
                 "System.Int64"   => corLib.Int64,
+                "System.UInt16"  => corLib.UInt16,
+                "System.UInt32"  => corLib.UInt32,
+                "System.UInt64"  => corLib.UInt64,
                 "System.Single"  => corLib.Single,
                 "System.Double"  => corLib.Double,
                 "System.Char"    => corLib.Char,
                 "System.String"  => corLib.String,
                 "System.Object"  => corLib.Object,
                 "System.IntPtr"  => corLib.IntPtr,
+                "System.UIntPtr" => corLib.UIntPtr,
+                "System.TypedReference" => corLib.TypedReference,
                 _ => BuildCustomTypeSig(fullName, module),
             };
 
@@ -532,16 +904,142 @@ namespace Krypton.Pipeline.Stages
             return new TypeDefOrRefSignature(typeRef, isValueType);
         }
 
+        // Builds an open-generic-definition type reference (name carries `N arity),
+        // reusing the same scope logic as plain references. Kept separate so the
+        // generic-instantiation path does not disturb the plain-reference path.
+        private static ITypeDefOrRef ResolveOrBuildTypeRef(string fullName, ModuleDefinition module)
+        {
+            if (string.IsNullOrWhiteSpace(fullName)) return null;
+            fullName = fullName.Trim();
+
+            // Reuse an existing reference, but for a core-library type prefer the
+            // core-library-scoped row over a facade (System) row that shares the name,
+            // so a generic definition binds to mscorlib rather than System.
+            var existingRefs = module.GetImportedTypeReferences()
+                .Where(r => string.Equals(r.FullName, fullName, StringComparison.Ordinal))
+                .ToList();
+            if (existingRefs.Count > 0)
+            {
+                if (IsCoreLibraryNamespace(fullName))
+                {
+                    var corlibName = module.CorLibTypeFactory.CorLibScope?.Name;
+                    var core = existingRefs.FirstOrDefault(r =>
+                        string.Equals(r.Scope?.Name, corlibName, StringComparison.OrdinalIgnoreCase));
+                    if (core != null) return core;
+                    return new TypeReference(module, module.CorLibTypeFactory.CorLibScope,
+                        GetNamespace(fullName), GetTypeName(fullName));
+                }
+                return existingRefs[0];
+            }
+
+            if (fullName.Contains("+"))
+            {
+                var parts = fullName.Split('+');
+                var outerScope = FindOrAddAssemblyRef(parts[0], module);
+                TypeReference current = new TypeReference(
+                    module, outerScope, GetNamespace(parts[0]), GetTypeName(parts[0]));
+                for (int p = 1; p < parts.Length; p++)
+                    current = new TypeReference(module, current, string.Empty, parts[p]);
+                return current;
+            }
+
+            var scope = FindOrAddAssemblyRef(fullName, module);
+            return new TypeReference(module, scope, GetNamespace(fullName), GetTypeName(fullName));
+        }
+
+        // The assembly recorded at capture time is authoritative; the namespace table
+        // below is only a fallback for evidence captured before that field existed.
+        private static IResolutionScope ResolveScope(
+            CalleeDescriptor callee,
+            string typeName,
+            ModuleDefinition module)
+        {
+            var declaring = callee?.DeclaringAssembly;
+            if (!string.IsNullOrWhiteSpace(declaring))
+            {
+                if (string.Equals(declaring, module.Assembly?.Name, StringComparison.OrdinalIgnoreCase))
+                    return module;
+                if (string.Equals(declaring, module.CorLibTypeFactory.CorLibScope?.Name,
+                        StringComparison.OrdinalIgnoreCase))
+                    return module.CorLibTypeFactory.CorLibScope;
+                return GetOrAddRef(module, declaring);
+            }
+
+            return FindOrAddAssemblyRef(typeName, module);
+        }
+
         private static IResolutionScope FindOrAddAssemblyRef(string typeName, ModuleDefinition module)
         {
-            // Heuristic: map known namespaces to assembly names
-            if (typeName.StartsWith("System.Windows.Forms") || typeName.Contains("/"))
+            var baseTypeName = (typeName ?? string.Empty).Split('/')[0];
+            var corlib = module.CorLibTypeFactory.CorLibScope;
+
+            // Authoritative: reuse the scope of a type the module already references.
+            // When several rows share the full name (a type both in the core library
+            // and forwarded through a facade), prefer the core-library-scoped one for
+            // core-library types so a generic definition like IEnumerable`1 does not
+            // pick up the System facade assembly.
+            var existing = module.GetImportedTypeReferences()
+                .Where(r => string.Equals(r.FullName, baseTypeName, StringComparison.Ordinal))
+                .ToList();
+            if (existing.Count > 0)
+            {
+                if (IsCoreLibraryNamespace(baseTypeName))
+                {
+                    var core = existing.FirstOrDefault(r =>
+                        string.Equals(r.Scope?.Name, corlib?.Name, StringComparison.OrdinalIgnoreCase));
+                    if (core?.Scope != null) return core.Scope;
+                    return corlib;
+                }
+                if (existing[0].Scope != null) return existing[0].Scope;
+            }
+
+            // Core-library namespaces live in the core library (mscorlib on this
+            // target), regardless of any same-prefixed facade assembly reference.
+            if (IsCoreLibraryNamespace(baseTypeName))
+                return corlib;
+
+            if (baseTypeName.StartsWith("System.Windows.Forms", StringComparison.Ordinal))
                 return GetOrAddRef(module, "System.Windows.Forms");
-            if (typeName.StartsWith("System.Drawing"))
+            if (baseTypeName.StartsWith("System.Drawing", StringComparison.Ordinal))
                 return GetOrAddRef(module, "System.Drawing");
-            if (typeName.StartsWith("System."))
-                return module.CorLibTypeFactory.CorLibScope;
-            return module.CorLibTypeFactory.CorLibScope;
+            if (baseTypeName.StartsWith("System.Management", StringComparison.Ordinal))
+                return GetOrAddRef(module, "System.Management");
+
+            // Match a dotted (sub-namespace) assembly whose name is the longest
+            // namespace prefix of the type - e.g. System.Xml.Linq.XElement -> the
+            // System.Xml.Linq assembly. The bare "System"/"mscorlib" assemblies are
+            // excluded here because their namespace ownership overlaps the core lib.
+            var byNamespace = module.AssemblyReferences
+                .Where(r => !string.IsNullOrEmpty(r.Name) && r.Name.Contains(".") &&
+                            !string.Equals(r.Name, corlib?.Name, StringComparison.OrdinalIgnoreCase) &&
+                            (baseTypeName + ".").StartsWith(r.Name + ".", StringComparison.Ordinal))
+                .OrderByDescending(r => r.Name.Length)
+                .FirstOrDefault();
+            if (byNamespace != null)
+                return byNamespace;
+            return corlib;
+        }
+
+        // Namespaces whose types reside in the core library on this target framework
+        // (mscorlib for .NET Framework). Kept as prefixes, not a per-type table.
+        private static bool IsCoreLibraryNamespace(string fullName)
+        {
+            if (string.IsNullOrEmpty(fullName)) return false;
+            string[] coreNs =
+            {
+                "System.Collections.Generic.", "System.Collections.ObjectModel.",
+                "System.Collections.", "System.Text.", "System.IO.",
+                "System.Threading.", "System.Reflection.", "System.Globalization.",
+                "System.Runtime.", "System.Security.", "System.Diagnostics.",
+            };
+            foreach (var ns in coreNs)
+                if (fullName.StartsWith(ns, StringComparison.Ordinal)) return true;
+            // Bare System.<Type> (no further dots) is core-library too (Object, Uri…).
+            var rest = fullName.StartsWith("System.", StringComparison.Ordinal)
+                ? fullName.Substring("System.".Length) : null;
+            return rest != null && !rest.Contains(".") && !rest.Contains("`") == false
+                ? false
+                : rest != null && !rest.Contains(".");
         }
 
         private static AssemblyReference GetOrAddRef(ModuleDefinition module, string name)
@@ -577,7 +1075,7 @@ namespace Krypton.Pipeline.Stages
             if (string.IsNullOrWhiteSpace(sig)) return "System.Void";
             sig = sig.TrimStart();
             if (sig.StartsWith("instance ")) sig = sig.Substring(9);
-            int paren = sig.IndexOf('(');
+            int paren = IndexOfTopLevel(sig, '(');
             return paren < 0 ? sig.Trim() : sig.Substring(0, paren).Trim();
         }
 
@@ -596,12 +1094,25 @@ namespace Krypton.Pipeline.Stages
     // Data model
     // ──────────────────────────────────────────────────────────────────────────
 
+    internal sealed class HiddenCallSiteResult
+    {
+        public string Caller { get; set; }
+        public int IlOffset { get; set; }
+        public string DelegateField { get; set; }
+        public string Pattern { get; set; }
+        public string CapturedTarget { get; set; }
+        public bool SignatureCompatible { get; set; }
+        public string DirectReplacement { get; set; }
+        public bool Rewrite { get; set; }
+    }
+
     internal sealed class CalleeDescriptor
     {
         public string       Opcode        { get; set; }
         public string       DeclaringType { get; set; }
         public string       MethodName    { get; set; }
         public string       MemberSig     { get; set; }
+        public string       DeclaringAssembly { get; set; }
         public List<string> ParamTypes    { get; set; } = new List<string>();
         public bool         IsInstance    { get; set; }
     }

@@ -85,6 +85,12 @@ namespace Krypton.Pipeline.Stages
             if (vmMethod.Parent == null)
                 throw new DevirtualizationException("VM method has no parent method.");
 
+            var logSemanticProgress = string.Equals(
+                Environment.GetEnvironmentVariable("KRYPTON_LOG_SEMANTIC_PROGRESS"),
+                "1",
+                StringComparison.Ordinal);
+            var progressName = vmMethod.Parent.FullName ?? "<unknown>";
+
             var relaxStackValidation = string.Equals(
                 Environment.GetEnvironmentVariable("KRYPTON_RELAX_STACK_VALIDATION"),
                 "1",
@@ -103,7 +109,11 @@ namespace Krypton.Pipeline.Stages
                                      CilMethodBodyBuildFlags.FullValidation);
             }
 
+            if (logSemanticProgress)
+                ctx.Options.Logger.Info($"[recompile] inferring locals {progressName}.");
             var localTypes = InferLocalTypes(ctx, vmMethod);
+            if (logSemanticProgress)
+                ctx.Options.Logger.Info($"[recompile] inferred locals {progressName}: count={localTypes.Count}.");
             if (string.Equals(Environment.GetEnvironmentVariable("KRYPTON_LOG_LOCAL_TYPES"), "1", StringComparison.Ordinal))
             {
                 var summary = string.Join(", ", localTypes.Select(t => t?.FullName ?? "<null>"));
@@ -136,6 +146,8 @@ namespace Krypton.Pipeline.Stages
                         $"Failed to translate VM instruction offset {vmInstruction.Offset} (vm:0x{vmInstruction.VmByte:X2}, op:{vmInstruction.OpCode}, operand:{vmInstruction.Operand ?? "<null>"}): {ex.Message}");
                 }
             }
+            if (logSemanticProgress)
+                ctx.Options.Logger.Info($"[recompile] emitted instructions {progressName}: cil={body.Instructions.Count}, branches={fixups.Count}, switches={switchFixups.Count}.");
 
             foreach (var fixup in fixups)
             {
@@ -153,6 +165,8 @@ namespace Krypton.Pipeline.Stages
                     translatedInstructionOrigins,
                     fixup.sourceInstruction);
             }
+            if (logSemanticProgress)
+                ctx.Options.Logger.Info($"[recompile] fixed branches {progressName}: cil={body.Instructions.Count}.");
 
             foreach (var switchFixup in switchFixups)
             {
@@ -169,12 +183,56 @@ namespace Krypton.Pipeline.Stages
                 switchFixup.instruction.Operand = labels;
             }
 
+            if (logSemanticProgress)
+                ctx.Options.Logger.Info($"[recompile] translated {progressName}: cil={body.Instructions.Count}.");
+
+            FixDelegateConstructionCalls(body);
             NormalizeDispatcherBranches(body);
             LiftDispatcherBranches(body, translatedInstructionOrigins);
+            if (logSemanticProgress)
+                ctx.Options.Logger.Info($"[recompile] lifted dispatcher {progressName}: cil={body.Instructions.Count}.");
+            BypassConstantDispatcherEntry(body);
             SpecializeDispatcherBlocksByEntryStackDepth(body, translatedInstructionOrigins, vmMethod);
+            if (logSemanticProgress)
+                ctx.Options.Logger.Info($"[recompile] specialized dispatcher {progressName}: cil={body.Instructions.Count}.");
             SanitizeUnreachableInvalidInstructions(body);
             ApplyExceptionHandlers(vmMethod, body, translatedInstructionMap);
+            FixDiscardLdlenAtExceptionBoundaries(body);
             return new RecompiledMethodArtifact(body, translatedInstructionOrigins);
+        }
+
+        private void BypassConstantDispatcherEntry(CilMethodBody body)
+        {
+            if (string.Equals(
+                    Environment.GetEnvironmentVariable("KRYPTON_DISABLE_CONSTANT_DISPATCHER_ENTRY_BYPASS"),
+                    "1",
+                    StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            if (body?.Instructions == null || body.Instructions.Count < 4)
+                return;
+
+            var constant = body.Instructions[0];
+            var store = body.Instructions[1];
+            var load = body.Instructions[2];
+            var dispatch = body.Instructions[3];
+            if (!TryGetInt32Constant(constant, out var state) ||
+                !IsMatchingDispatcherStore(load, store) ||
+                dispatch.OpCode != CilOpCodes.Switch ||
+                !(dispatch.Operand is IList<ICilLabel> targets) ||
+                !TryGetSwitchTarget(targets, state, out var target))
+            {
+                return;
+            }
+
+            // Preserve the original selector/store/switch instructions for any
+            // internal branch that targets them. Only make the method-entry edge
+            // explicit so verifier analysis does not treat every switch case as
+            // reachable from an actually constant selector.
+            constant.OpCode = CilOpCodes.Br;
+            constant.Operand = new CilInstructionLabel(target);
         }
 
         private bool TryNormalizeInstructionOffset(int rawOffset, int instructionCount, out int normalizedOffset)
@@ -205,15 +263,35 @@ namespace Krypton.Pipeline.Stages
         private List<TypeSignature> InferLocalTypes(DevirtualizationCtx ctx, VMMethod vmMethod)
         {
             var maxLocalIndex = -1;
+            VMInstruction maxLocalInstruction = null;
             foreach (var instruction in vmMethod.MethodBody.Instructions)
             {
-                if ((instruction.OpCode == VMOpCode.Stloc || instruction.OpCode == VMOpCode.Ldloc) &&
+                if ((instruction.OpCode == VMOpCode.Stloc ||
+                     instruction.OpCode == VMOpCode.Ldloc ||
+                     instruction.OpCode == VMOpCode.Ldloca) &&
                     instruction.Operand is int index &&
                     index > maxLocalIndex)
+                {
                     maxLocalIndex = index;
+                    maxLocalInstruction = instruction;
+                }
             }
 
-            var localCount = Math.Max(vmMethod.MethodBody.Locals.Count, maxLocalIndex + 1);
+            var declaredLocalCount = vmMethod.MethodBody.Locals.Count;
+            var maximumSynthesizedLocalCount = 4096;
+            var configuredLimit = Environment.GetEnvironmentVariable("KRYPTON_MAX_SYNTHESIZED_LOCALS");
+            if (int.TryParse(configuredLimit, out var parsedLimit) && parsedLimit > 0)
+                maximumSynthesizedLocalCount = parsedLimit;
+
+            var safeLocalCountLimit = Math.Max(declaredLocalCount, maximumSynthesizedLocalCount);
+            if (maxLocalIndex >= safeLocalCountLimit)
+            {
+                throw new DevirtualizationException(
+                    $"Local index {maxLocalIndex} exceeds safety limit {safeLocalCountLimit - 1} " +
+                    $"at VM offset {maxLocalInstruction?.Offset ?? -1} (vm:0x{maxLocalInstruction?.VmByte ?? 0:X2}).");
+            }
+
+            var localCount = Math.Max(declaredLocalCount, maxLocalIndex + 1);
             var types = new List<TypeSignature>(localCount);
             for (var i = 0; i < localCount; i++)
             {
@@ -246,7 +324,174 @@ namespace Krypton.Pipeline.Stages
                 }
             }
 
+            // Address loads are normally consumed immediately by a call's final
+            // ref/out parameter. Reactor's serialized local table can retain only a
+            // placeholder type here, which produces valid-looking but unsafe casts in
+            // decompilers (for example out *(GameObject*)(&objectLocal)). Recover the
+            // element type directly from the callee signature.
+            for (var i = 0; i + 1 < vmMethod.MethodBody.Instructions.Count; i++)
+            {
+                var addressLoad = vmMethod.MethodBody.Instructions[i];
+                if (addressLoad.OpCode != VMOpCode.Ldloca ||
+                    !(addressLoad.Operand is int localIndex) ||
+                    localIndex < 0 ||
+                    localIndex >= types.Count)
+                {
+                    continue;
+                }
+
+                var consumer = vmMethod.MethodBody.Instructions[i + 1];
+                if ((consumer.OpCode != VMOpCode.Call && consumer.OpCode != VMOpCode.Callvirt) ||
+                    !(consumer.Operand is int methodToken) ||
+                    !TryResolveMethodDescriptor(ctx, methodToken, out var descriptor))
+                {
+                    continue;
+                }
+
+                var signature = descriptor.Signature ?? descriptor.Resolve()?.Signature;
+                if (signature?.ParameterTypes == null || signature.ParameterTypes.Count == 0)
+                    continue;
+
+                if (signature.ParameterTypes[signature.ParameterTypes.Count - 1] is ByReferenceTypeSignature byRef &&
+                    byRef.BaseType != null)
+                {
+                    types[localIndex] = SubstituteDeclaringTypeGenericArgument(descriptor, byRef.BaseType);
+                }
+            }
+
+            // The other reason to take a local's address is to call an instance
+            // method on it, which only needs an address when the local is a value
+            // type. Reactor's local table keeps a placeholder for those, and leaving
+            // it as object hands the callee a pointer to a reference-sized slot.
+            for (var i = 0; i < vmMethod.MethodBody.Instructions.Count; i++)
+            {
+                var addressLoad = vmMethod.MethodBody.Instructions[i];
+                if (addressLoad.OpCode != VMOpCode.Ldloca ||
+                    !(addressLoad.Operand is int addressLocalIndex) ||
+                    addressLocalIndex < 0 ||
+                    addressLocalIndex >= types.Count)
+                {
+                    continue;
+                }
+
+                var receiverType = InferValueTypeFromAddressReceiver(ctx, vmMethod, i);
+                if (receiverType != null)
+                    types[addressLocalIndex] = receiverType;
+            }
+
             return types;
+        }
+
+        // Walks forward from an Ldloca to whatever consumes the address. A
+        // "constrained." prefix names the type outright; otherwise the address is the
+        // receiver of the first call reached with exactly that call's argument count
+        // on the stack. Anything unknown, or any transfer of control, abandons the
+        // walk rather than guessing.
+        private TypeSignature InferValueTypeFromAddressReceiver(
+            DevirtualizationCtx ctx,
+            VMMethod vmMethod,
+            int addressIndex)
+        {
+            var instructions = vmMethod.MethodBody.Instructions;
+            var depth = 0;
+
+            for (var j = addressIndex + 1; j < instructions.Count && j <= addressIndex + 32; j++)
+            {
+                var instruction = instructions[j];
+
+                switch (instruction.OpCode)
+                {
+                    case VMOpCode.Constrained:
+                        if (depth != 0 || !(instruction.Operand is int constrainedToken))
+                            return null;
+                        try
+                        {
+                            var constrainedType = ResolveTypeFromToken(ctx, constrainedToken);
+                            return constrainedType == null ? null : new TypeDefOrRefSignature(constrainedType, true);
+                        }
+                        catch
+                        {
+                            return null;
+                        }
+
+                    case VMOpCode.Call:
+                    case VMOpCode.Callvirt:
+                    {
+                        if (!(instruction.Operand is int callToken) ||
+                            !TryResolveMethodDescriptor(ctx, callToken, out var callee))
+                        {
+                            return null;
+                        }
+
+                        var calleeSignature = callee.Signature ?? callee.Resolve()?.Signature;
+                        if (calleeSignature == null ||
+                            !calleeSignature.HasThis ||
+                            calleeSignature.ParameterTypes.Count != depth)
+                        {
+                            return null;
+                        }
+
+                        var declaringType = callee.DeclaringType as ITypeDefOrRef;
+                        if (declaringType == null)
+                            return null;
+                        AsmResolver.DotNet.TypeDefinition declaringDefinition = null;
+                        try
+                        {
+                            declaringDefinition = declaringType?.Resolve();
+                        }
+                        catch
+                        {
+                        }
+
+                        return declaringDefinition != null && declaringDefinition.IsValueType
+                            ? new TypeDefOrRefSignature(declaringType, true)
+                            : null;
+                    }
+
+                    case VMOpCode.Br:
+                    case VMOpCode.Leave:
+                    case VMOpCode.Ret:
+                    case VMOpCode.EndFinally:
+                    case VMOpCode.Switch:
+                    case VMOpCode.BrTrue:
+                    case VMOpCode.BrFalse:
+                    case VMOpCode.BrEqual:
+                    case VMOpCode.BrNotEqual:
+                    case VMOpCode.BrLessThan:
+                    case VMOpCode.BrGreaterThan:
+                    case VMOpCode.BrLessOrEqual:
+                    case VMOpCode.BrGreaterOrEqual:
+                    case VMOpCode.Newobj:
+                        return null;
+                }
+
+                if (!TryGetApproximateStackEffect(instruction.OpCode, out var pop, out var push))
+                    return null;
+
+                depth = depth - pop + push;
+                if (depth < 0)
+                    return null;
+            }
+
+            return null;
+        }
+
+        private TypeSignature SubstituteDeclaringTypeGenericArgument(
+            IMethodDescriptor descriptor,
+            TypeSignature signature)
+        {
+            if (!(signature is GenericParameterSignature genericParameter) ||
+                genericParameter.ParameterType != GenericParameterType.Type ||
+                !(descriptor is IMethodDefOrRef method) ||
+                !(method.DeclaringType is AsmResolver.DotNet.TypeSpecification typeSpecification) ||
+                !(typeSpecification.Signature is GenericInstanceTypeSignature genericInstance) ||
+                genericParameter.Index < 0 ||
+                genericParameter.Index >= genericInstance.TypeArguments.Count)
+            {
+                return signature;
+            }
+
+            return genericInstance.TypeArguments[genericParameter.Index];
         }
 
         private bool ShouldPreferInferredLocalType(
@@ -330,6 +575,11 @@ namespace Krypton.Pipeline.Stages
                     candidate.OpCode == VMOpCode.BrTrue ||
                     candidate.OpCode == VMOpCode.BrFalse ||
                     candidate.OpCode == VMOpCode.BrLessThan ||
+                    candidate.OpCode == VMOpCode.BrGreaterThan ||
+                    candidate.OpCode == VMOpCode.BrLessOrEqual ||
+                    candidate.OpCode == VMOpCode.BrGreaterOrEqual ||
+                    candidate.OpCode == VMOpCode.BrEqual ||
+                    candidate.OpCode == VMOpCode.BrNotEqual ||
                     candidate.OpCode == VMOpCode.Switch ||
                     candidate.OpCode == VMOpCode.Ret)
                 {
@@ -344,16 +594,28 @@ namespace Krypton.Pipeline.Stages
         {
             pop = 0;
             push = 0;
+            if (VMOpCodeCatalog.TryGet(opCode, out var semantic) &&
+                semantic.HasFixedStackEffect)
+            {
+                pop = semantic.Pop;
+                push = semantic.Push;
+                return true;
+            }
             switch (opCode)
             {
                 case VMOpCode.Nop:
                     return true;
                 case VMOpCode.Ldarg:
                 case VMOpCode.Ldloc:
+                case VMOpCode.Ldloca:
                 case VMOpCode.Ldc_I4:
+                case VMOpCode.Ldc_I8:
+                case VMOpCode.Ldc_R4:
+                case VMOpCode.Ldc_R8:
                 case VMOpCode.Ldstr:
                 case VMOpCode.Ldnull:
                 case VMOpCode.Ldsfld:
+                case VMOpCode.Ldsflda:
                 case VMOpCode.Newobj:
                     push = 1;
                     return true;
@@ -361,8 +623,14 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Ldlen:
                 case VMOpCode.Ldobj:
                 case VMOpCode.Unbox_Any:
+                case VMOpCode.Box:
+                case VMOpCode.Isinst:
+                case VMOpCode.Castclass:
+                case VMOpCode.Ldflda:
                     pop = 1;
                     push = 1;
+                    return true;
+                case VMOpCode.Constrained:
                     return true;
                 case VMOpCode.Ldelem_Ref:
                 case VMOpCode.Ldelem_U1:
@@ -383,6 +651,7 @@ namespace Krypton.Pipeline.Stages
                     push = 2;
                     return true;
                 case VMOpCode.Add:
+                case VMOpCode.Ceq:
                 case VMOpCode.Sub:
                 case VMOpCode.Xor:
                 case VMOpCode.Shl:
@@ -403,6 +672,11 @@ namespace Krypton.Pipeline.Stages
                     pop = 1;
                     return true;
                 case VMOpCode.BrLessThan:
+                case VMOpCode.BrGreaterThan:
+                case VMOpCode.BrLessOrEqual:
+                case VMOpCode.BrGreaterOrEqual:
+                case VMOpCode.BrEqual:
+                case VMOpCode.BrNotEqual:
                     pop = 2;
                     return true;
                 case VMOpCode.Switch:
@@ -455,7 +729,13 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Conv_U1:
                 case VMOpCode.Not:
                     return ctx.Module.CorLibTypeFactory.Int32;
+                case VMOpCode.Ldc_R4:
+                    return ctx.Module.CorLibTypeFactory.Single;
+                case VMOpCode.Ldc_R8:
+                    return ctx.Module.CorLibTypeFactory.Double;
+                case VMOpCode.Ldc_I8:
                 case VMOpCode.Conv_I8:
+                case VMOpCode.Conv_U8:
                     return ctx.Module.CorLibTypeFactory.Int64;
                 case VMOpCode.Ldnull:
                     return ctx.Module.CorLibTypeFactory.Object;
@@ -469,10 +749,14 @@ namespace Krypton.Pipeline.Stages
                         : new SzArrayTypeSignature(new TypeDefOrRefSignature(elementType));
                 }
                 case VMOpCode.Unbox_Any:
+                case VMOpCode.Isinst:
+                case VMOpCode.Castclass:
                 {
                     var targetType = ResolveTypeFromToken(ctx, producer.Operand);
                     return targetType == null ? null : new TypeDefOrRefSignature(targetType);
                 }
+                case VMOpCode.Box:
+                    return ctx.Module.CorLibTypeFactory.Object;
                 case VMOpCode.Newobj:
                 {
                     var descriptor = ResolveMethodDescriptor(ctx, producer.Operand) as IMethodDefOrRef;
@@ -514,13 +798,72 @@ namespace Krypton.Pipeline.Stages
             if (descriptor == null)
                 return null;
 
+            IList<TypeSignature> methodArguments = null;
+            var target = descriptor;
             if (descriptor is AsmResolver.DotNet.MethodSpecification methodSpec)
             {
-                var baseReturnType = methodSpec.Method?.Signature?.ReturnType;
-                return SubstituteMethodGenericArguments(baseReturnType, methodSpec.Signature?.TypeArguments);
+                methodArguments = methodSpec.Signature?.TypeArguments;
+                target = methodSpec.Method;
             }
 
-            return descriptor.Signature?.ReturnType;
+            var returnType = target?.Signature?.ReturnType;
+            returnType = SubstituteMethodGenericArguments(returnType, methodArguments);
+
+            // The declaring type's own arguments matter just as much: calling
+            // IEnumerable<T>::GetEnumerator() on IEnumerable<IRegEditor> returns
+            // IEnumerator<IRegEditor>, not IEnumerator<!0>. Leaving !0 in place
+            // produces a local signature the runtime cannot parse at all.
+            return SubstituteTypeGenericArguments(returnType, DeclaringTypeArguments(target));
+        }
+
+        private static IList<TypeSignature> DeclaringTypeArguments(IMethodDescriptor descriptor)
+        {
+            var specification = descriptor?.DeclaringType as AsmResolver.DotNet.TypeSpecification;
+            return (specification?.Signature as GenericInstanceTypeSignature)?.TypeArguments;
+        }
+
+        private TypeSignature SubstituteTypeGenericArguments(
+            TypeSignature signature,
+            IList<TypeSignature> typeArguments)
+        {
+            if (signature == null)
+                return null;
+
+            if (signature is GenericParameterSignature genericParameter &&
+                genericParameter.ParameterType == GenericParameterType.Type &&
+                typeArguments != null &&
+                genericParameter.Index >= 0 &&
+                genericParameter.Index < typeArguments.Count)
+                return typeArguments[genericParameter.Index];
+
+            if (signature is SzArrayTypeSignature szArray)
+            {
+                var baseType = SubstituteTypeGenericArguments(szArray.BaseType, typeArguments);
+                if (baseType == null || ReferenceEquals(baseType, szArray.BaseType))
+                    return signature;
+                return new SzArrayTypeSignature(baseType);
+            }
+
+            if (signature is GenericInstanceTypeSignature genericInstance)
+            {
+                var changed = false;
+                var substituted = new TypeSignature[genericInstance.TypeArguments.Count];
+                for (var i = 0; i < genericInstance.TypeArguments.Count; i++)
+                {
+                    var current = genericInstance.TypeArguments[i];
+                    substituted[i] = SubstituteTypeGenericArguments(current, typeArguments);
+                    if (!ReferenceEquals(substituted[i], current))
+                        changed = true;
+                }
+
+                if (!changed)
+                    return signature;
+
+                return new GenericInstanceTypeSignature(
+                    genericInstance.GenericType, genericInstance.IsValueType, substituted);
+            }
+
+            return signature;
         }
 
         private TypeSignature SubstituteMethodGenericArguments(
@@ -574,18 +917,51 @@ namespace Krypton.Pipeline.Stages
             ICollection<(CilInstruction instruction, int targetOffset, int sourceOffset, VMInstruction sourceInstruction)> fixups,
             ICollection<(CilInstruction instruction, int[] targets)> switchFixups)
         {
+            var semantic = VMOpCodeCatalog.Get(instruction.OpCode);
+            if (semantic.Flow == VMFlowKind.ConditionalBranch)
+            {
+                var conditional = new CilInstruction(semantic.CilOpCode);
+                fixups.Add((conditional, Convert.ToInt32(instruction.Operand), instruction.Offset, instruction));
+                return conditional;
+            }
+
+            if (semantic.Encodings == VMOperandEncoding.None &&
+                semantic.TokenKind == VMMetadataTokenKind.None)
+            {
+                return EmitOperandlessInstruction(instruction.OpCode);
+            }
+
+            if (semantic.TokenKind == VMMetadataTokenKind.Type &&
+                instruction.OpCode != VMOpCode.Ldobj &&
+                instruction.OpCode != VMOpCode.Stobj)
+            {
+                return new CilInstruction(
+                    semantic.CilOpCode,
+                    ResolveTypeFromToken(ctx, instruction.Operand));
+            }
+
             switch (instruction.OpCode)
             {
                 case VMOpCode.Nop:
                     return new CilInstruction(CilOpCodes.Nop);
                 case VMOpCode.Ldarg:
                     return BuildLdargInstruction(vmMethod, locals, instruction.Operand);
+                case VMOpCode.Ldarga:
+                    return new CilInstruction(CilOpCodes.Ldarga, Convert.ToInt32(instruction.Operand));
+                case VMOpCode.Starg:
+                    return new CilInstruction(CilOpCodes.Starg, Convert.ToInt32(instruction.Operand));
                 case VMOpCode.Ldloc:
                     return BuildLdlocInstruction(locals, instruction.Operand);
+                case VMOpCode.Ldloca:
+                    return BuildLdlocaInstruction(locals, instruction.Operand);
                 case VMOpCode.Stloc:
                     return BuildStlocInstruction(locals, instruction.Operand);
                 case VMOpCode.Ldsfld:
                     return new CilInstruction(CilOpCodes.Ldsfld, ResolveFieldDescriptor(ctx, instruction.Operand));
+                case VMOpCode.Ldsflda:
+                    return new CilInstruction(CilOpCodes.Ldsflda, ResolveFieldDescriptor(ctx, instruction.Operand));
+                case VMOpCode.Ldflda:
+                    return new CilInstruction(CilOpCodes.Ldflda, ResolveFieldDescriptor(ctx, instruction.Operand));
                 case VMOpCode.Ldfld:
                     return new CilInstruction(CilOpCodes.Ldfld, ResolveFieldDescriptor(ctx, instruction.Operand));
                 case VMOpCode.Stsfld:
@@ -594,6 +970,12 @@ namespace Krypton.Pipeline.Stages
                     return new CilInstruction(CilOpCodes.Stfld, ResolveFieldDescriptor(ctx, instruction.Operand));
                 case VMOpCode.Ldc_I4:
                     return new CilInstruction(CilOpCodes.Ldc_I4, Convert.ToInt32(instruction.Operand));
+                case VMOpCode.Ldc_I8:
+                    return new CilInstruction(CilOpCodes.Ldc_I8, Convert.ToInt64(instruction.Operand));
+                case VMOpCode.Ldc_R4:
+                    return new CilInstruction(CilOpCodes.Ldc_R4, Convert.ToSingle(instruction.Operand));
+                case VMOpCode.Ldc_R8:
+                    return new CilInstruction(CilOpCodes.Ldc_R8, Convert.ToDouble(instruction.Operand));
                 case VMOpCode.Ldelem_Ref:
                     return new CilInstruction(CilOpCodes.Ldelem_Ref);
                 case VMOpCode.Ldelem_U1:
@@ -620,6 +1002,14 @@ namespace Krypton.Pipeline.Stages
                     return new CilInstruction(CilOpCodes.Newarr, ResolveTypeFromToken(ctx, instruction.Operand));
                 case VMOpCode.Unbox_Any:
                     return new CilInstruction(CilOpCodes.Unbox_Any, ResolveTypeFromToken(ctx, instruction.Operand));
+                case VMOpCode.Isinst:
+                    return new CilInstruction(CilOpCodes.Isinst, ResolveTypeFromToken(ctx, instruction.Operand));
+                case VMOpCode.Castclass:
+                    return new CilInstruction(CilOpCodes.Castclass, ResolveTypeFromToken(ctx, instruction.Operand));
+                case VMOpCode.Box:
+                    return new CilInstruction(CilOpCodes.Box, ResolveTypeFromToken(ctx, instruction.Operand));
+                case VMOpCode.Constrained:
+                    return new CilInstruction(CilOpCodes.Constrained, ResolveTypeFromToken(ctx, instruction.Operand));
                 case VMOpCode.Br:
                     return BuildUnconditionalBranch(instruction, fixups);
                 case VMOpCode.BrTrue:
@@ -630,7 +1020,25 @@ namespace Krypton.Pipeline.Stages
                 }
                 case VMOpCode.BrLessThan:
                 {
-                    var branch = new CilInstruction(CilOpCodes.Blt_Un);
+                    var branch = new CilInstruction(CilOpCodes.Blt);
+                    fixups.Add((branch, Convert.ToInt32(instruction.Operand), instruction.Offset, instruction));
+                    return branch;
+                }
+                case VMOpCode.BrGreaterThan:
+                case VMOpCode.BrLessOrEqual:
+                case VMOpCode.BrGreaterOrEqual:
+                case VMOpCode.BrEqual:
+                case VMOpCode.BrNotEqual:
+                {
+                    var opCode = instruction.OpCode switch
+                    {
+                        VMOpCode.BrGreaterThan => CilOpCodes.Bgt,
+                        VMOpCode.BrLessOrEqual => CilOpCodes.Ble,
+                        VMOpCode.BrGreaterOrEqual => CilOpCodes.Bge,
+                        VMOpCode.BrEqual => CilOpCodes.Beq,
+                        _ => CilOpCodes.Bne_Un
+                    };
+                    var branch = new CilInstruction(opCode);
                     fixups.Add((branch, Convert.ToInt32(instruction.Operand), instruction.Offset, instruction));
                     return branch;
                 }
@@ -662,6 +1070,8 @@ namespace Krypton.Pipeline.Stages
                     return new CilInstruction(CilOpCodes.Not);
                 case VMOpCode.Add:
                     return new CilInstruction(CilOpCodes.Add);
+                case VMOpCode.Ceq:
+                    return new CilInstruction(CilOpCodes.Ceq);
                 case VMOpCode.Xor:
                     return new CilInstruction(CilOpCodes.Xor);
                 case VMOpCode.Shl:
@@ -711,6 +1121,18 @@ namespace Krypton.Pipeline.Stages
                 default:
                     throw new DevirtualizationException($"Cannot recompile unsupported VM opcode: {instruction.OpCode}");
             }
+        }
+
+        internal static CilInstruction EmitOperandlessInstruction(VMOpCode opCode)
+        {
+            var semantic = VMOpCodeCatalog.Get(opCode);
+            if (semantic.Encodings != VMOperandEncoding.None ||
+                semantic.TokenKind != VMMetadataTokenKind.None)
+            {
+                throw new ArgumentException($"{opCode} is not an operandless VM instruction.", nameof(opCode));
+            }
+
+            return new CilInstruction(semantic.CilOpCode);
         }
 
         private CilInstruction BuildUnconditionalBranch(
@@ -777,6 +1199,95 @@ namespace Krypton.Pipeline.Stages
                 instructionOrigins.Insert(branchIndex + 1, sourceInstruction);
                 instructionOrigins.Insert(branchIndex + 2, sourceInstruction);
             }
+        }
+
+        private void FixDiscardLdlenAtExceptionBoundaries(CilMethodBody body)
+        {
+            // The VM byte that structurally matches Ldlen is also reused as a
+            // plain discard right before leaving a protected block and as the
+            // first instruction of a catch/filter handler. Neither position can
+            // ever hold a real array reference (a handler entry always starts
+            // with the exception object), and treating it as Ldlen there leaves
+            // the try and fall-through edges disagreeing on stack depth at the
+            // merge point.
+            var instructions = body?.Instructions;
+            if (instructions == null || instructions.Count == 0)
+                return;
+
+            var handlerEntryInstructions = new HashSet<CilInstruction>(ReferenceEqualityComparer.Instance);
+            foreach (var handler in body.ExceptionHandlers)
+            {
+                if (handler.HandlerStart is CilInstructionLabel handlerLabel && handlerLabel.Instruction != null)
+                    handlerEntryInstructions.Add(handlerLabel.Instruction);
+                if (handler.FilterStart is CilInstructionLabel filterLabel && filterLabel.Instruction != null)
+                    handlerEntryInstructions.Add(filterLabel.Instruction);
+            }
+
+            for (var i = 0; i < instructions.Count; i++)
+            {
+                var instruction = instructions[i];
+                if (instruction.OpCode != CilOpCodes.Ldlen)
+                    continue;
+
+                var precedesLeaveOrEndfinally = i + 1 < instructions.Count &&
+                    (instructions[i + 1].OpCode == CilOpCodes.Leave ||
+                     instructions[i + 1].OpCode == CilOpCodes.Endfinally);
+
+                if (handlerEntryInstructions.Contains(instruction) || precedesLeaveOrEndfinally)
+                    instruction.OpCode = CilOpCodes.Pop;
+            }
+        }
+
+        private void FixDelegateConstructionCalls(CilMethodBody body)
+        {
+            // this/ldftn/newobj delegate construction virtualizes as an ordinary
+            // Call to the target method followed by Newobj on the delegate type.
+            // Executing that Call for real (instead of taking its function
+            // pointer) drops the delegate target off the stack and starves the
+            // Newobj of an argument, showing up as a stack underflow right at
+            // the Newobj site.
+            var instructions = body?.Instructions;
+            if (instructions == null || instructions.Count < 2)
+                return;
+
+            for (var i = 0; i < instructions.Count - 1; i++)
+            {
+                var call = instructions[i];
+                if ((call.OpCode != CilOpCodes.Call && call.OpCode != CilOpCodes.Callvirt) ||
+                    !(call.Operand is IMethodDescriptor))
+                {
+                    continue;
+                }
+
+                var next = instructions[i + 1];
+                if (next.OpCode != CilOpCodes.Newobj ||
+                    !(next.Operand is IMethodDescriptor ctor) ||
+                    !IsDelegateConstructor(ctor))
+                {
+                    continue;
+                }
+
+                call.OpCode = call.OpCode == CilOpCodes.Callvirt ? CilOpCodes.Ldvirtftn : CilOpCodes.Ldftn;
+            }
+        }
+
+        private bool IsDelegateConstructor(IMethodDescriptor ctor)
+        {
+            // Every delegate type's constructor has this exact (object, native int)
+            // shape and it is reserved by the CLR for delegate wiring, so matching
+            // the signature is enough -- no need to resolve the declaring type
+            // (which can fail for framework types when no assembly resolver has
+            // access to the original runtime's reference assemblies).
+            if (!string.Equals(ctor.Name, ".ctor", StringComparison.Ordinal))
+                return false;
+
+            var parameters = ctor.Signature?.ParameterTypes;
+            if (parameters == null || parameters.Count != 2)
+                return false;
+
+            return string.Equals(parameters[0].FullName, "System.Object", StringComparison.Ordinal) &&
+                   (string.Equals(parameters[1].FullName, "System.IntPtr", StringComparison.Ordinal) ||
+                    string.Equals(parameters[1].FullName, "System.UIntPtr", StringComparison.Ordinal));
         }
 
         private void NormalizeDispatcherBranches(CilMethodBody body)
@@ -1182,6 +1693,7 @@ namespace Krypton.Pipeline.Stages
             CilMethodBody body,
             DispatcherDescriptor dispatcher)
         {
+            const int maxScheduledStates = 32768;
             var instructions = body.Instructions;
             var instructionIndexByInstruction = new Dictionary<CilInstruction, int>(
                 instructions.Count,
@@ -1193,7 +1705,26 @@ namespace Krypton.Pipeline.Stages
             var pending = new Queue<DispatcherAnalysisState>();
             var rewrites = new Dictionary<CilInstruction, DispatcherRewritePlan>(
                 ReferenceEqualityComparer.Instance);
-            pending.Enqueue(new DispatcherAnalysisState(
+            var scheduledStateCount = 0;
+            var stateLimitReached = false;
+
+            void Schedule(DispatcherAnalysisState candidate)
+            {
+                if (candidate == null || stateLimitReached)
+                    return;
+                if (scheduledStateCount >= maxScheduledStates)
+                {
+                    stateLimitReached = true;
+                    return;
+                }
+                if (!RegisterDispatcherAnalysisState(seenStates, candidate))
+                    return;
+
+                scheduledStateCount++;
+                pending.Enqueue(candidate);
+            }
+
+            Schedule(new DispatcherAnalysisState(
                 0,
                 DispatcherAbstractValue.Unknown,
                 Array.Empty<DispatcherAbstractValue>()));
@@ -1203,8 +1734,6 @@ namespace Krypton.Pipeline.Stages
                 var state = pending.Dequeue();
                 if (state.InstructionIndex < 0 || state.InstructionIndex >= instructions.Count)
                     continue;
-                if (!RegisterDispatcherAnalysisState(seenStates, state))
-                    continue;
 
                 var instruction = instructions[state.InstructionIndex];
                 if (ReferenceEquals(instruction, dispatcher.SwitchInstruction))
@@ -1212,7 +1741,7 @@ namespace Krypton.Pipeline.Stages
                     if (TryResolveDispatcherTargetFromStack(state.Stack, dispatcher, out var targetInstruction, out var remainingStack) &&
                         instructionIndexByInstruction.TryGetValue(targetInstruction, out var targetIndex))
                     {
-                        pending.Enqueue(new DispatcherAnalysisState(targetIndex, state.SelectorValue, remainingStack));
+                        Schedule(new DispatcherAnalysisState(targetIndex, state.SelectorValue, remainingStack));
                     }
 
                     continue;
@@ -1230,14 +1759,14 @@ namespace Krypton.Pipeline.Stages
                         instructionIndexByInstruction.TryGetValue(outcome.TargetInstruction, out var targetIndex))
                     {
                         RegisterDispatcherRewrite(rewrites, instruction, outcome);
-                        pending.Enqueue(new DispatcherAnalysisState(targetIndex, state.SelectorValue, outcome.ResultingStack));
+                        Schedule(new DispatcherAnalysisState(targetIndex, state.SelectorValue, outcome.ResultingStack));
                         continue;
                     }
 
                     if (unconditionalLabel.Instruction != null &&
                         instructionIndexByInstruction.TryGetValue(unconditionalLabel.Instruction, out var branchTarget))
                     {
-                        pending.Enqueue(new DispatcherAnalysisState(branchTarget, state.SelectorValue, state.Stack));
+                        Schedule(new DispatcherAnalysisState(branchTarget, state.SelectorValue, state.Stack));
                     }
 
                     continue;
@@ -1256,17 +1785,17 @@ namespace Krypton.Pipeline.Stages
                         instructionIndexByInstruction.TryGetValue(outcome.TargetInstruction, out var targetIndex))
                     {
                         RegisterDispatcherRewrite(rewrites, instruction, outcome);
-                        pending.Enqueue(new DispatcherAnalysisState(targetIndex, state.SelectorValue, outcome.ResultingStack));
+                        Schedule(new DispatcherAnalysisState(targetIndex, state.SelectorValue, outcome.ResultingStack));
                     }
                     else if (conditionalLabel.Instruction != null &&
                              instructionIndexByInstruction.TryGetValue(conditionalLabel.Instruction, out var conditionalTarget))
                     {
-                        pending.Enqueue(new DispatcherAnalysisState(conditionalTarget, state.SelectorValue, stackAfterCondition));
+                        Schedule(new DispatcherAnalysisState(conditionalTarget, state.SelectorValue, stackAfterCondition));
                     }
 
                     var nextIndex = state.InstructionIndex + 1;
                     if (nextIndex < instructions.Count)
-                        pending.Enqueue(new DispatcherAnalysisState(nextIndex, state.SelectorValue, stackAfterCondition));
+                        Schedule(new DispatcherAnalysisState(nextIndex, state.SelectorValue, stackAfterCondition));
                     continue;
                 }
 
@@ -1286,8 +1815,14 @@ namespace Krypton.Pipeline.Stages
                     instruction.OpCode.Code != CilCode.Ret &&
                     instruction.OpCode.Code != CilCode.Endfinally)
                 {
-                    pending.Enqueue(new DispatcherAnalysisState(fallthroughIndex, nextSelector, nextStack));
+                    Schedule(new DispatcherAnalysisState(fallthroughIndex, nextSelector, nextStack));
                 }
+            }
+
+            if (stateLimitReached)
+            {
+                return new Dictionary<CilInstruction, DispatcherRewritePlan>(
+                    ReferenceEqualityComparer.Instance);
             }
 
             var filtered = new Dictionary<CilInstruction, DispatcherRewritePlan>(
@@ -1599,7 +2134,7 @@ namespace Krypton.Pipeline.Stages
             out DispatcherAbstractValue[] remainingStack)
         {
             remainingStack = null;
-            var popCount = opCode == CilOpCodes.Blt_Un || opCode == CilOpCodes.Bge_Un
+            var popCount = IsBinaryConditionalBranch(opCode)
                 ? 2
                 : 1;
 
@@ -1657,6 +2192,8 @@ namespace Krypton.Pipeline.Stages
             switch (instruction.OpCode.Code)
             {
                 case CilCode.Nop:
+                case CilCode.Box:
+                case CilCode.Constrained:
                     return true;
 
                 case CilCode.Pop:
@@ -1771,6 +2308,7 @@ namespace Krypton.Pipeline.Stages
             switch (instruction.OpCode.Code)
             {
                 case CilCode.Nop:
+                case CilCode.Constrained:
                     return true;
 
                 case CilCode.Ldarg:
@@ -1818,6 +2356,12 @@ namespace Krypton.Pipeline.Stages
 
                 case CilCode.Blt_Un:
                 case CilCode.Bge_Un:
+                case CilCode.Blt:
+                case CilCode.Bgt:
+                case CilCode.Ble:
+                case CilCode.Bge:
+                case CilCode.Beq:
+                case CilCode.Bne_Un:
                     pop = 2;
                     return true;
 
@@ -1837,6 +2381,7 @@ namespace Krypton.Pipeline.Stages
                 case CilCode.Conv_U1:
                 case CilCode.Ldlen:
                 case CilCode.Unbox_Any:
+                case CilCode.Box:
                 case CilCode.Ldind_I1:
                 case CilCode.Ldind_U1:
                 case CilCode.Ldind_I2:
@@ -1927,7 +2472,18 @@ namespace Krypton.Pipeline.Stages
             return opCode == CilOpCodes.Brtrue ||
                    opCode == CilOpCodes.Brfalse ||
                    opCode == CilOpCodes.Blt_Un ||
-                   opCode == CilOpCodes.Bge_Un;
+                   opCode == CilOpCodes.Bge_Un ||
+                   IsBinaryConditionalBranch(opCode);
+        }
+
+        private bool IsBinaryConditionalBranch(CilOpCode opCode)
+        {
+            return opCode == CilOpCodes.Blt ||
+                   opCode == CilOpCodes.Bgt ||
+                   opCode == CilOpCodes.Ble ||
+                   opCode == CilOpCodes.Bge ||
+                   opCode == CilOpCodes.Beq ||
+                   opCode == CilOpCodes.Bne_Un;
         }
 
         private bool IsDispatcherSelectorLoadInstruction(CilInstruction instruction, DispatcherDescriptor dispatcher)
@@ -2057,6 +2613,9 @@ namespace Krypton.Pipeline.Stages
             List<VMInstruction> instructionOrigins,
             VMMethod vmMethod)
         {
+            const int maxVariants = 4096;
+            const int maxInstructionGrowthFactor = 8;
+            const int maxSpecializedInstructions = 250000;
             var logSpecialization = string.Equals(
                 Environment.GetEnvironmentVariable("KRYPTON_LOG_DNLIB_STACK"),
                 "1",
@@ -2074,7 +2633,13 @@ namespace Krypton.Pipeline.Stages
 
             var variants = new Dictionary<(int blockIndex, int entryDepth), StackDepthVariant>();
             var pending = new Queue<(int blockIndex, int entryDepth)>();
+            var scheduled = new HashSet<(int blockIndex, int entryDepth)>();
             var emissionOrder = new List<StackDepthVariant>();
+            var instructionBudget = Math.Min(
+                (long) maxSpecializedInstructions,
+                Math.Max((long) body.Instructions.Count, (long) body.Instructions.Count * maxInstructionGrowthFactor));
+            long projectedInstructionCount = 0;
+            scheduled.Add((0, 0));
             pending.Enqueue((0, 0));
 
             while (pending.Count > 0)
@@ -2082,7 +2647,7 @@ namespace Krypton.Pipeline.Stages
                 var key = pending.Dequeue();
                 if (variants.ContainsKey(key))
                     continue;
-                if (variants.Count >= 4096)
+                if (variants.Count >= maxVariants)
                     return Fail("variant limit exceeded.");
                 if (key.entryDepth < 0 || key.entryDepth > 512)
                     return Fail($"unsupported entry depth {key.entryDepth} for block {key.blockIndex}.");
@@ -2090,8 +2655,17 @@ namespace Krypton.Pipeline.Stages
                 var block = blocks[key.blockIndex];
                 if (!TryComputeBlockExitDepth(body, block, vmMethod, key.entryDepth, out var exitDepth))
                 {
+                    var blockOps = string.Join(", ", Enumerable.Range(block.StartIndex, block.EndIndex - block.StartIndex + 1)
+                        .Select(index =>
+                        {
+                            var origin = index < instructionOrigins.Count ? instructionOrigins[index] : null;
+                            var operand = body.Instructions[index].Operand == null
+                                ? string.Empty
+                                : $"({body.Instructions[index].Operand})";
+                            return $"{index}:{body.Instructions[index].OpCode.Code}{operand}[vm:{(origin == null ? "--" : origin.VmByte.ToString("X2"))},off:{(origin == null ? "--" : origin.Offset.ToString())}]";
+                        }));
                     return Fail(
-                        $"failed to simulate block {block.Index} [{block.StartIndex},{block.EndIndex}] with entry depth {key.entryDepth}; start={body.Instructions[block.StartIndex].OpCode.Code}, end={body.Instructions[block.EndIndex].OpCode.Code}.");
+                        $"failed to simulate block {block.Index} [{block.StartIndex},{block.EndIndex}] with entry depth {key.entryDepth}; ops={blockOps}.");
                 }
 
                 var variant = new StackDepthVariant(block.Index, key.entryDepth)
@@ -2101,11 +2675,25 @@ namespace Krypton.Pipeline.Stages
                 variants[key] = variant;
                 emissionOrder.Add(variant);
 
+                var projectedBlockLength = block.EndIndex - block.StartIndex + 1;
+                if (block.FlowKind == StackDepthBlockFlowKind.FallThroughOnly ||
+                    block.FlowKind == StackDepthBlockFlowKind.ConditionalBranch ||
+                    block.FlowKind == StackDepthBlockFlowKind.Switch)
+                {
+                    projectedBlockLength++;
+                }
+                projectedInstructionCount += projectedBlockLength;
+                if (projectedInstructionCount > instructionBudget)
+                {
+                    return Fail(
+                        $"instruction growth limit exceeded ({projectedInstructionCount} > {instructionBudget}).");
+                }
+
                 foreach (var successorBlock in block.BranchSuccessors)
                 {
                     var successorKey = (successorBlock, exitDepth);
                     variant.BranchSuccessors.Add(successorKey);
-                    if (!variants.ContainsKey(successorKey))
+                    if (scheduled.Add(successorKey))
                         pending.Enqueue(successorKey);
                 }
 
@@ -2113,7 +2701,7 @@ namespace Krypton.Pipeline.Stages
                 {
                     var fallthroughKey = (block.FallthroughSuccessor.Value, exitDepth);
                     variant.FallthroughSuccessor = fallthroughKey;
-                    if (!variants.ContainsKey(fallthroughKey))
+                    if (scheduled.Add(fallthroughKey))
                         pending.Enqueue(fallthroughKey);
                 }
             }
@@ -2262,12 +2850,26 @@ namespace Krypton.Pipeline.Stages
                     case CilCode.Br:
                     case CilCode.Leave:
                         AddLeader(leaders, instruction.Operand, instructionIndexByInstruction);
+                        // The instruction after an unconditional transfer starts a
+                        // separate (possibly unreachable) basic block. Keeping it
+                        // in the predecessor makes stack simulation incorrectly
+                        // fall through a br/leave.
+                        if (i + 1 < body.Instructions.Count)
+                            leaders.Add(i + 1);
                         break;
 
                     case CilCode.Brtrue:
                     case CilCode.Brfalse:
                     case CilCode.Blt_Un:
                     case CilCode.Bge_Un:
+                    case CilCode.Bgt_Un:
+                    case CilCode.Ble_Un:
+                    case CilCode.Blt:
+                    case CilCode.Bgt:
+                    case CilCode.Ble:
+                    case CilCode.Bge:
+                    case CilCode.Beq:
+                    case CilCode.Bne_Un:
                         AddLeader(leaders, instruction.Operand, instructionIndexByInstruction);
                         if (i + 1 < body.Instructions.Count)
                             leaders.Add(i + 1);
@@ -2317,6 +2919,14 @@ namespace Krypton.Pipeline.Stages
                     case CilCode.Brfalse:
                     case CilCode.Blt_Un:
                     case CilCode.Bge_Un:
+                    case CilCode.Bgt_Un:
+                    case CilCode.Ble_Un:
+                    case CilCode.Blt:
+                    case CilCode.Bgt:
+                    case CilCode.Ble:
+                    case CilCode.Bge:
+                    case CilCode.Beq:
+                    case CilCode.Bne_Un:
                         if (TryGetTargetBlock(terminator.Operand, instructionIndexByInstruction, blockIndexByStart, out var conditionalTarget))
                             block.BranchSuccessors.Add(conditionalTarget);
                         if (block.EndIndex + 1 < body.Instructions.Count &&
@@ -2414,6 +3024,7 @@ namespace Krypton.Pipeline.Stages
             switch (instruction.OpCode.Code)
             {
                 case CilCode.Nop:
+                case CilCode.Constrained:
                     return true;
 
                 case CilCode.Ldarg:
@@ -2477,6 +3088,14 @@ namespace Krypton.Pipeline.Stages
 
                 case CilCode.Blt_Un:
                 case CilCode.Bge_Un:
+                case CilCode.Bgt_Un:
+                case CilCode.Ble_Un:
+                case CilCode.Blt:
+                case CilCode.Bgt:
+                case CilCode.Ble:
+                case CilCode.Bge:
+                case CilCode.Beq:
+                case CilCode.Bne_Un:
                     pop = 2;
                     return true;
 
@@ -2496,6 +3115,7 @@ namespace Krypton.Pipeline.Stages
                 case CilCode.Conv_U1:
                 case CilCode.Ldlen:
                 case CilCode.Unbox_Any:
+                case CilCode.Box:
                 case CilCode.Ldind_I1:
                 case CilCode.Ldind_U1:
                 case CilCode.Ldind_I2:
@@ -2656,6 +3276,14 @@ namespace Krypton.Pipeline.Stages
                     case CilCode.Brfalse:
                     case CilCode.Blt_Un:
                     case CilCode.Bge_Un:
+                    case CilCode.Bgt_Un:
+                    case CilCode.Ble_Un:
+                    case CilCode.Blt:
+                    case CilCode.Bgt:
+                    case CilCode.Ble:
+                    case CilCode.Bge:
+                    case CilCode.Beq:
+                    case CilCode.Bne_Un:
                         PushTargetInstruction(worklist, instruction.Operand, instructionIndexByInstruction);
                         worklist.Push(index + 1);
                         break;
@@ -2724,6 +3352,18 @@ namespace Krypton.Pipeline.Stages
                 return CilOpCodes.Brtrue;
             if (opCode == CilOpCodes.Blt_Un)
                 return CilOpCodes.Bge_Un;
+            if (opCode == CilOpCodes.Blt)
+                return CilOpCodes.Bge;
+            if (opCode == CilOpCodes.Bgt)
+                return CilOpCodes.Ble;
+            if (opCode == CilOpCodes.Ble)
+                return CilOpCodes.Bgt;
+            if (opCode == CilOpCodes.Bge)
+                return CilOpCodes.Blt;
+            if (opCode == CilOpCodes.Beq)
+                return CilOpCodes.Bne_Un;
+            if (opCode == CilOpCodes.Bne_Un)
+                return CilOpCodes.Beq;
             return null;
         }
 
@@ -2879,6 +3519,15 @@ namespace Krypton.Pipeline.Stages
                 default:
                     return new CilInstruction(CilOpCodes.Ldloc, locals[index]);
             }
+        }
+
+        private CilInstruction BuildLdlocaInstruction(IList<CilLocalVariable> locals, object operand)
+        {
+            var index = Convert.ToInt32(operand);
+            if (index < 0 || index >= locals.Count)
+                throw new DevirtualizationException($"Invalid ldloca index {index}.");
+
+            return new CilInstruction(CilOpCodes.Ldloca, locals[index]);
         }
 
         private CilInstruction BuildStlocInstruction(IList<CilLocalVariable> locals, object operand)

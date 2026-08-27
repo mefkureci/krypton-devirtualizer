@@ -101,6 +101,7 @@ namespace Krypton.Pipeline
 
         public DevirtualizationCtx Ctx { get; set; }
         public List<IStage> Stages { get; set; }
+        public bool InventoryOnlyCompleted { get; private set; }
 
         public void Devirtualize()
         {
@@ -109,6 +110,17 @@ namespace Krypton.Pipeline
                 Ctx.Options.Logger.Info($"Executing {stage.Name} Stage...");
                 stage.Run(Ctx);
                 Ctx.Options.Logger.Success($"Executed {stage.Name} Stage!");
+                if (stage is SemanticValidation &&
+                    string.Equals(
+                        Environment.GetEnvironmentVariable("KRYPTON_INVENTORY_ONLY"),
+                        "1",
+                        StringComparison.Ordinal))
+                {
+                    InventoryOnlyCompleted = true;
+                    Ctx.Options.Logger.Info(
+                        "Inventory-only mode stopped after SemanticValidation; no lowering, rewriting or runtime-assisted stage ran.");
+                    break;
+                }
             }
         }
 
@@ -126,6 +138,8 @@ namespace Krypton.Pipeline
                 GetHandlerSnippet);
             if (!string.IsNullOrWhiteSpace(reportPath))
                 Ctx.Options.Logger.Success($"Wrote report at {reportPath}");
+
+            DumpAllHandlerSnippets();
 
             var outputDecision = OutputEligibilityService.Evaluate(Ctx);
             if (outputDecision.MethodsWithUnknownCount > 0)
@@ -158,6 +172,7 @@ namespace Krypton.Pipeline
             Ctx.Options.Logger.Warning(
                 "In-place method patch failed. Skipping full PE rebuild to avoid producing a broken PE layout. " +
                 "Use the unpacked/working base binary as input.");
+
             RemoveStaleOutputFile("this run could not produce a valid patched output");
         }
 
@@ -198,6 +213,14 @@ namespace Krypton.Pipeline
             {
                 Ctx.Options.Logger.Warning(
                     $"Restored {restoredNecrobitBodies} NecroBit runtime method body/bodies from Hashtable dump.");
+
+                // NecroBit bodies are injected during Save(), after the normal stage
+                // list has already run. Re-run the existing HiddenCallRecovery stage
+                // over those restored bodies so wrapper-form delegate calls can be
+                // replaced before the output image is written.
+                Ctx.Options.Logger.Info(
+                    "Running HiddenCallRecovery again over NecroBit-restored bodies.");
+                new HiddenCallRecovery().Run(Ctx);
             }
 
             if (methodsToPatch.Count == 0 && !allowStabilizationOnlyOutput && restoredNecrobitBodies == 0)
@@ -3294,6 +3317,7 @@ namespace Krypton.Pipeline
                 }
 
                 var restored = 0;
+                var restoredMethods = new List<AsmResolver.DotNet.MethodDefinition>();
                 foreach (var entry in methods.EnumerateArray())
                 {
                     var tokenText = ReadString(entry, "Token");
@@ -3321,9 +3345,27 @@ namespace Krypton.Pipeline
                     if (rawBody.Length == 0)
                         continue;
 
-                    if (TryReplaceMethodInstructionsFromRawCil(module, method, rawBody))
+                    if (TryReplaceMethodInstructionsFromRawCil(module, method, rawBody, entry))
+                    {
                         restored++;
+                        restoredMethods.Add(method);
+                    }
                 }
+
+                // A restored body still reaches for the protection's runtime object to
+                // decode its string literals. That object does not exist in a
+                // standalone output, so the literals are inlined here from evidence
+                // captured against the live original. The keyed-string shape is not
+                // unique to freshly injected bodies: methods the protection left as
+                // real IL carry the same decoder pattern and the same dependency on
+                // the runtime singleton, so every method with a body is inlined, not
+                // just the restored set. This is what removes the singleton from the
+                // whole application graph rather than only the NecroBit closure.
+                var allBodies = Ctx.Module.GetAllTypes()
+                    .SelectMany(t => t.Methods)
+                    .Where(m => m.CilMethodBody != null)
+                    .ToList();
+                InlineKeyedStringsInRestoredBodies(originalPath, allBodies);
 
                 return restored;
             }
@@ -3334,10 +3376,286 @@ namespace Krypton.Pipeline
             }
         }
 
+        private void InlineKeyedStringsInRestoredBodies(
+            string originalPath,
+            List<AsmResolver.DotNet.MethodDefinition> restoredMethods)
+        {
+            if (restoredMethods == null || restoredMethods.Count == 0)
+                return;
+
+            var evidencePath = Path.ChangeExtension(originalPath, null) + "-keyed-strings.json";
+            if (!File.Exists(evidencePath))
+            {
+                Ctx?.Options?.Logger?.Info(
+                    "No keyed-string evidence next to the input; restored bodies keep their " +
+                    "dependency on the protection runtime.");
+                return;
+            }
+
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(evidencePath));
+                var root = doc.RootElement;
+                if (!TryParseMetadataToken(ReadString(root, "Singleton"), out var singleton) ||
+                    !TryParseMetadataToken(ReadString(root, "Decoder"), out var decoder))
+                {
+                    Ctx?.Options?.Logger?.Warning("Keyed-string evidence lacks singleton/decoder tokens.");
+                    return;
+                }
+
+                var values = new Dictionary<(uint KeyField, uint Encoded), string>();
+                if (root.TryGetProperty("Strings", out var strings) &&
+                    strings.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var item in strings.EnumerateArray())
+                    {
+                        var text = ReadString(item, "Value");
+                        if (text == null)
+                            continue;
+                        if (!TryParseMetadataToken(ReadString(item, "KeyField"), out var keyField))
+                            continue;
+                        var encodedText = ReadString(item, "Encoded");
+                        if (string.IsNullOrWhiteSpace(encodedText))
+                            continue;
+                        if (encodedText.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                            encodedText = encodedText.Substring(2);
+                        if (!uint.TryParse(encodedText, System.Globalization.NumberStyles.HexNumber,
+                                System.Globalization.CultureInfo.InvariantCulture, out var encoded))
+                        {
+                            continue;
+                        }
+                        values[(keyField, encoded)] = text;
+                    }
+                }
+
+                var unresolved = 0;
+                var missing = new HashSet<(uint KeyField, uint Encoded)>();
+                var inlined = Krypton.Pipeline.Stages.StringDecryption.InlineKeyedDecoderCalls(
+                    restoredMethods,
+                    singleton,
+                    decoder,
+                    values,
+                    message =>
+                    {
+                        unresolved++;
+                        Ctx?.Options?.Logger?.Warning(message);
+                    },
+                    missing);
+
+                // Every newly restored body brings its own literals with it, so
+                // evidence captured for an earlier one is always a step behind.
+                // Rather than leave those sites tied to the protection runtime, ask
+                // the live original for exactly the pairs that are missing and inline
+                // them in a second pass. The ids come from the sites themselves, so
+                // nothing here is specific to one sample.
+                if (missing.Count > 0 &&
+                    TryEvaluateKeyedStrings(originalPath, evidencePath, singleton, decoder, missing, values))
+                {
+                    unresolved = 0;
+                    inlined += Krypton.Pipeline.Stages.StringDecryption.InlineKeyedDecoderCalls(
+                        restoredMethods,
+                        singleton,
+                        decoder,
+                        values,
+                        message =>
+                        {
+                            unresolved++;
+                            Ctx?.Options?.Logger?.Warning(message);
+                        });
+                }
+
+                Ctx?.Options?.Logger?.Warning(
+                    $"Inlined {inlined} keyed string literal(s) into restored bodies " +
+                    $"from {values.Count} evidence entry/entries; {unresolved} site(s) left untouched.");
+            }
+            catch (Exception ex)
+            {
+                Ctx?.Options?.Logger?.Warning($"Failed to inline keyed strings: {ex.Message}");
+            }
+        }
+
+        // Runs the decoder inside the live original for the pairs that have no
+        // recorded value yet, then merges the answers into the in-memory table and
+        // the evidence file so a later run starts from them. The key is read off the
+        // protection's own runtime object, so the value produced is the one the
+        // original method would have seen.
+        private bool TryEvaluateKeyedStrings(
+            string originalPath,
+            string evidencePath,
+            uint singleton,
+            uint decoder,
+            IReadOnlyCollection<(uint KeyField, uint Encoded)> missing,
+            Dictionary<(uint KeyField, uint Encoded), string> values)
+        {
+            // At assembly scale there can be thousands of pairs; passing them as
+            // command-line args overflows the OS limit, so they go through a file
+            // that the runner reads via a single "@path" argument.
+            var pairsPath = Path.ChangeExtension(originalPath, null) + "-keyed-strings.pairs.txt";
+            try
+            {
+                File.WriteAllLines(pairsPath, missing.Select(pair =>
+                    "0x" + pair.KeyField.ToString("X8") + ":0x" + pair.Encoded.ToString("X8")));
+            }
+            catch (Exception ex)
+            {
+                Ctx?.Options?.Logger?.Warning($"Could not write keyed-string pairs file: {ex.Message}");
+                return false;
+            }
+
+            var arguments = new[]
+            {
+                "0x" + singleton.ToString("X8"),
+                "0x" + decoder.ToString("X8"),
+                "@" + pairsPath
+            };
+
+            var evaluatedPath = Path.ChangeExtension(originalPath, null) + "-keyed-strings.new.json";
+            Ctx?.Options?.Logger?.Info(
+                $"Evaluating {missing.Count} keyed string id(s) that have no evidence yet.");
+            if (!InvokeRunner("--eval-keyed-strings", originalPath, evaluatedPath, "KeyedStrings",
+                    arguments))
+            {
+                return false;
+            }
+
+            var added = 0;
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(evaluatedPath));
+                if (!doc.RootElement.TryGetProperty("Strings", out var strings) ||
+                    strings.ValueKind != JsonValueKind.Array)
+                {
+                    return false;
+                }
+
+                foreach (var item in strings.EnumerateArray())
+                {
+                    var text = ReadString(item, "Value");
+                    if (text == null)
+                    {
+                        Ctx?.Options?.Logger?.Warning(
+                            "keyed string id " + ReadString(item, "Encoded") + " did not decode: " +
+                            (ReadString(item, "Error") ?? "no value"));
+                        continue;
+                    }
+                    if (!TryParseMetadataToken(ReadString(item, "KeyField"), out var keyField) ||
+                        !TryParseHexUInt32(ReadString(item, "Encoded"), out var encoded))
+                    {
+                        continue;
+                    }
+
+                    values[(keyField, encoded)] = text;
+                    added++;
+                }
+            }
+            catch (Exception ex)
+            {
+                Ctx?.Options?.Logger?.Warning($"Could not read evaluated keyed strings: {ex.Message}");
+                return false;
+            }
+
+            if (added == 0)
+                return false;
+
+            WriteKeyedStringEvidence(evidencePath, singleton, decoder, values);
+            Ctx?.Options?.Logger?.Info($"Recovered {added} keyed string value(s) from the original.");
+            return true;
+        }
+
+        private void WriteKeyedStringEvidence(
+            string evidencePath,
+            uint singleton,
+            uint decoder,
+            Dictionary<(uint KeyField, uint Encoded), string> values)
+        {
+            try
+            {
+                var rows = new List<Dictionary<string, string>>();
+                foreach (var entry in values)
+                {
+                    rows.Add(new Dictionary<string, string>
+                    {
+                        ["KeyField"] = "0x" + entry.Key.KeyField.ToString("X8"),
+                        ["Encoded"] = "0x" + entry.Key.Encoded.ToString("X8"),
+                        ["Value"] = entry.Value
+                    });
+                }
+
+                var document = new Dictionary<string, object>
+                {
+                    ["Singleton"] = "0x" + singleton.ToString("X8"),
+                    ["Decoder"] = "0x" + decoder.ToString("X8"),
+                    ["Strings"] = rows
+                };
+
+                File.WriteAllText(
+                    evidencePath,
+                    System.Text.Json.JsonSerializer.Serialize(
+                        document,
+                        new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            }
+            catch (Exception ex)
+            {
+                Ctx?.Options?.Logger?.Warning($"Could not update keyed-string evidence: {ex.Message}");
+            }
+        }
+
+        private static bool TryParseHexUInt32(string text, out uint value)
+        {
+            value = 0;
+            if (string.IsNullOrWhiteSpace(text))
+                return false;
+            text = text.Trim();
+            if (text.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                text = text.Substring(2);
+            return uint.TryParse(text, System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture, out value);
+        }
+
+        // A catch type must be resolved by name. The token reported for it at runtime
+        // is a row in the module that DEFINES the type, so resolving it against the
+        // assembly being rewritten silently yields an unrelated type and the handler
+        // then catches nothing.
+        private ITypeDefOrRef ResolveCatchType(
+            AsmResolver.DotNet.ModuleDefinition module,
+            JsonElement clause)
+        {
+            var fullName = ReadString(clause, "CatchTypeName");
+            if (string.IsNullOrWhiteSpace(fullName))
+                return null;
+
+            foreach (var type in module.GetAllTypes())
+            {
+                if (string.Equals(type.FullName, fullName, StringComparison.Ordinal))
+                    return type;
+            }
+
+            var separator = fullName.LastIndexOf('.');
+            var ns = separator > 0 ? fullName.Substring(0, separator) : null;
+            var name = separator > 0 ? fullName.Substring(separator + 1) : fullName;
+
+            var assemblyName = ReadString(clause, "CatchTypeAssembly");
+            IResolutionScope scope = module.CorLibTypeFactory.CorLibScope;
+            if (!string.IsNullOrWhiteSpace(assemblyName))
+            {
+                foreach (var reference in module.AssemblyReferences)
+                {
+                    if (string.Equals(reference.Name, assemblyName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        scope = reference;
+                        break;
+                    }
+                }
+            }
+
+            return new AsmResolver.DotNet.TypeReference(module, scope, ns, name);
+        }
+
         private bool TryReplaceMethodInstructionsFromRawCil(
             AsmResolver.DotNet.ModuleDefinition module,
             AsmResolver.DotNet.MethodDefinition method,
-            byte[] rawBody)
+            byte[] rawBody,
+            JsonElement entry = default)
         {
             try
             {
@@ -3354,7 +3672,28 @@ namespace Krypton.Pipeline
 
                 body.Instructions.Clear();
                 body.Instructions.AddRange(instructions);
-                body.ComputeMaxStackOnBuild = true;
+
+                // The IL alone is not the body: a restored method that uses locals or
+                // protected regions is invalid without them, and the stub it replaces
+                // declares neither.
+                ApplyRestoredBodyShape(module, body, instructions, entry);
+
+                // Prefer the max stack the protection recorded for the real body. The
+                // recomputation can undercount when a reconstructed call reference's
+                // stack effect is read differently than at capture time, which the JIT
+                // then rejects as an invalid program; the captured value is what the
+                // body actually ran with.
+                if (entry.ValueKind == JsonValueKind.Object &&
+                    entry.TryGetProperty("MaxStackSize", out var msProp) &&
+                    msProp.TryGetInt32(out var capturedMaxStack) && capturedMaxStack > 0)
+                {
+                    body.ComputeMaxStackOnBuild = false;
+                    body.MaxStack = capturedMaxStack;
+                }
+                else
+                {
+                    body.ComputeMaxStackOnBuild = true;
+                }
                 body.VerifyLabelsOnBuild = false;
                 body.BuildFlags &= ~(CilMethodBodyBuildFlags.VerifyLabels |
                                      CilMethodBodyBuildFlags.FullValidation);
@@ -3366,6 +3705,99 @@ namespace Krypton.Pipeline
                 Ctx?.Options?.Logger?.Warning(
                     $"Failed to restore NecroBit body for {method?.FullName ?? "<method>"}: {ex.Message}");
                 return false;
+            }
+        }
+
+        // Restores everything the method body header carries besides the instruction
+        // stream: the local signature the protection installed, the initlocals flag
+        // and the exception handling table.
+        private void ApplyRestoredBodyShape(
+            AsmResolver.DotNet.ModuleDefinition module,
+            CilMethodBody body,
+            IList<CilInstruction> instructions,
+            JsonElement entry)
+        {
+            if (entry.ValueKind != JsonValueKind.Object)
+                return;
+
+            body.InitializeLocals = entry.TryGetProperty("InitLocals", out var initLocals) &&
+                                    initLocals.ValueKind == JsonValueKind.True;
+
+            body.LocalVariables.Clear();
+            var localSigText = ReadString(entry, "LocalSignatureToken");
+            if (TryParseMetadataToken(localSigText, out var localSigToken) && localSigToken != 0)
+            {
+                object member = null;
+                try
+                {
+                    member = module.LookupMember(new AsmResolver.PE.DotNet.Metadata.Tables.MetadataToken(localSigToken));
+                }
+                catch
+                {
+                }
+
+                if (member is StandAloneSignature standAlone &&
+                    standAlone.Signature is LocalVariablesSignature locals)
+                {
+                    foreach (var variableType in locals.VariableTypes)
+                        body.LocalVariables.Add(new CilLocalVariable(variableType));
+                }
+            }
+
+            body.ExceptionHandlers.Clear();
+            if (!entry.TryGetProperty("Eh", out var clauses) || clauses.ValueKind != JsonValueKind.Array)
+                return;
+
+            var byOffset = new Dictionary<int, CilInstruction>();
+            foreach (var instruction in instructions)
+                byOffset[(int)instruction.Offset] = instruction;
+
+            CilInstructionLabel LabelAt(int offset)
+            {
+                return byOffset.TryGetValue(offset, out var instruction)
+                    ? new CilInstructionLabel(instruction)
+                    : null;
+            }
+
+            foreach (var clause in clauses.EnumerateArray())
+            {
+                var kindText = ReadString(clause, "Flags") ?? string.Empty;
+                var tryStart = LabelAt(ReadInt(clause, "TryOffset"));
+                var tryEnd = LabelAt(ReadInt(clause, "TryOffset") + ReadInt(clause, "TryLength"));
+                var handlerStart = LabelAt(ReadInt(clause, "HandlerOffset"));
+                var handlerEnd = LabelAt(ReadInt(clause, "HandlerOffset") + ReadInt(clause, "HandlerLength"));
+                if (tryStart == null || tryEnd == null || handlerStart == null || handlerEnd == null)
+                {
+                    Ctx?.Options?.Logger?.Warning(
+                        $"Restored body for {body.Owner?.FullName}: dropped an exception clause whose bounds " +
+                        "do not fall on instruction boundaries.");
+                    continue;
+                }
+
+                var handlerType = kindText.IndexOf("Finally", StringComparison.OrdinalIgnoreCase) >= 0
+                    ? CilExceptionHandlerType.Finally
+                    : kindText.IndexOf("Filter", StringComparison.OrdinalIgnoreCase) >= 0
+                        ? CilExceptionHandlerType.Filter
+                        : kindText.IndexOf("Fault", StringComparison.OrdinalIgnoreCase) >= 0
+                            ? CilExceptionHandlerType.Fault
+                            : CilExceptionHandlerType.Exception;
+
+                ITypeDefOrRef catchType = null;
+                if (handlerType == CilExceptionHandlerType.Exception)
+                    catchType = ResolveCatchType(module, clause);
+
+                body.ExceptionHandlers.Add(new CilExceptionHandler
+                {
+                    HandlerType = handlerType,
+                    TryStart = tryStart,
+                    TryEnd = tryEnd,
+                    HandlerStart = handlerStart,
+                    HandlerEnd = handlerEnd,
+                    ExceptionType = catchType,
+                    FilterStart = handlerType == CilExceptionHandlerType.Filter
+                        ? LabelAt(ReadInt(clause, "FilterOffset"))
+                        : null
+                });
             }
         }
 
@@ -5994,7 +6426,14 @@ namespace Krypton.Pipeline
                     m.Name == ".cctor" && m.IsStatic && m.CilMethodBody != null);
                 if (cctor?.CilMethodBody == null)
                     continue;
-                if (!LooksLikeBootstrapTypeInitializer(cctor))
+                var decision = ClassifyTypeInitializer(cctor);
+                Ctx?.Options?.Logger?.Info(
+                    $"[cctor] {type.FullName} token=0x{cctor.MetadataToken.ToUInt32():X8} " +
+                    $"instr={cctor.CilMethodBody.Instructions.Count} " +
+                    $"ownStaticStores={decision.OwnStaticStores} " +
+                    $"hugeWorker={decision.HugeWorker} -> " +
+                    (decision.Neutralize ? "NEUTRALIZE" : "KEEP") + " (" + decision.Reason + ")");
+                if (!decision.Neutralize)
                     continue;
 
                 var replacement = new CilMethodBody(cctor)
@@ -6009,6 +6448,73 @@ namespace Krypton.Pipeline
             }
 
             return patched;
+        }
+
+        private sealed class TypeInitializerDecision
+        {
+            public bool Neutralize;
+            public bool HugeWorker;
+            public int OwnStaticStores;
+            public string Reason = string.Empty;
+        }
+
+        // A type initializer is only protection bootstrap when there is positive
+        // evidence for it. Dispatching into a huge obfuscated worker is that evidence,
+        // but on its own it also describes an ordinary application initializer that
+        // happens to call a large (or control-flow-flattened) helper. What separates
+        // the two is purpose: the protection's initializers exist to start its runtime
+        // and do not populate the application's own static state, whereas that is
+        // exactly what a normal initializer is for. So a cctor that stores into fields
+        // of its own type is kept, and anything not demonstrated to be bootstrap is
+        // kept as well - a false negative leaves a working body, a false positive
+        // silently deletes program state.
+        private TypeInitializerDecision ClassifyTypeInitializer(
+            AsmResolver.DotNet.MethodDefinition cctor)
+        {
+            var decision = new TypeInitializerDecision
+            {
+                HugeWorker = LooksLikeBootstrapTypeInitializer(cctor)
+            };
+
+            var owner = cctor.DeclaringType;
+            foreach (var instruction in cctor.CilMethodBody.Instructions)
+            {
+                if (instruction.OpCode.Code != CilCode.Stsfld)
+                    continue;
+                if (!(instruction.Operand is IFieldDescriptor field))
+                    continue;
+
+                AsmResolver.DotNet.FieldDefinition definition = null;
+                try
+                {
+                    definition = field.Resolve();
+                }
+                catch
+                {
+                }
+
+                if (definition?.DeclaringType != null &&
+                    ReferenceEquals(definition.DeclaringType, owner))
+                {
+                    decision.OwnStaticStores++;
+                }
+            }
+
+            if (!decision.HugeWorker)
+            {
+                decision.Reason = "no dispatch into a huge worker";
+                return decision;
+            }
+
+            if (decision.OwnStaticStores > 0)
+            {
+                decision.Reason = "initializes its own type's static state";
+                return decision;
+            }
+
+            decision.Neutralize = true;
+            decision.Reason = "dispatches into a huge worker and initializes no state of its own";
+            return decision;
         }
 
         private bool LooksLikeBootstrapTypeInitializer(AsmResolver.DotNet.MethodDefinition cctor)
@@ -6820,6 +7326,60 @@ namespace Krypton.Pipeline
             return line;
         }
 
+
+        // Diagnostics: writes the real VM handler body for every mapped opcode so a
+        // mapping can be checked against the handler's actual semantics instead of
+        // against statistical evidence. Enabled with KRYPTON_DUMP_ALL_HANDLERS=<path>.
+        private void DumpAllHandlerSnippets()
+        {
+            var outputPath = Environment.GetEnvironmentVariable("KRYPTON_DUMP_ALL_HANDLERS");
+            if (string.IsNullOrWhiteSpace(outputPath))
+                return;
+            if (Ctx.OpcodeHandlerMethod?.CilMethodBody?.Instructions == null || Ctx.OpcodeHandlerIndices == null)
+            {
+                Ctx.Options.Logger.Warning("Handler dump requested but no VM handler map is available.");
+                return;
+            }
+
+            var instructions = Ctx.OpcodeHandlerMethod.CilMethodBody.Instructions;
+            var maxLines = 120;
+            var sb = new System.Text.StringBuilder(256 * 1024);
+            sb.AppendLine($"VM handler method: {Ctx.OpcodeHandlerMethod.FullName}");
+            sb.AppendLine($"Handler instruction count: {instructions.Count}");
+            sb.AppendLine();
+
+            foreach (var pair in Ctx.OpcodeHandlerIndices.OrderBy(p => p.Key))
+            {
+                var vmByte = pair.Key;
+                var mapped = Ctx.PatternMatcher != null && Ctx.PatternMatcher.IsOpCodeValueKnown(vmByte)
+                    ? Ctx.PatternMatcher.GetOpCodeValue(vmByte).ToString()
+                    : "<unknown>";
+                var source = Ctx.OpcodeConfidence != null && Ctx.OpcodeConfidence.TryGetValue(vmByte, out var conf)
+                    ? $"conf={conf.Confidence:F2} source={conf.Source}"
+                    : "conf=n/a";
+
+                sb.AppendLine($"===== vm 0x{vmByte:X2} -> {mapped} ({source}) handlerIndex={pair.Value} =====");
+                for (var i = pair.Value; i < instructions.Count && i < pair.Value + maxLines; i++)
+                {
+                    var instruction = instructions[i];
+                    var operand = instruction.Operand == null ? string.Empty : " " + instruction.Operand;
+                    sb.AppendLine($"  [{i}] {instruction.OpCode}{operand}");
+                    if (instruction.OpCode == AsmResolver.PE.DotNet.Cil.CilOpCodes.Ret)
+                        break;
+                }
+                sb.AppendLine();
+            }
+
+            try
+            {
+                System.IO.File.WriteAllText(outputPath, sb.ToString());
+                Ctx.Options.Logger.Success($"Wrote full handler dump at {outputPath}");
+            }
+            catch (Exception ex)
+            {
+                Ctx.Options.Logger.Warning($"Could not write handler dump: {ex.Message}");
+            }
+        }
         private IEnumerable<string> GetHandlerSnippet(int vmByte)
         {
             if (Ctx.OpcodeHandlerMethod == null || Ctx.OpcodeHandlerIndices == null)

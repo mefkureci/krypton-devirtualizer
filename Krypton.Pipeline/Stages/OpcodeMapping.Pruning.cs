@@ -580,10 +580,23 @@ namespace Krypton.Pipeline.Stages
 
         private bool RequiresSemanticOperandPrune(VMOpCode mapped)
         {
+            var semantic = VMOpCodeCatalog.Get(mapped);
+            if (semantic.TokenKind != VMMetadataTokenKind.None ||
+                semantic.Flow == VMFlowKind.UnconditionalBranch ||
+                semantic.Flow == VMFlowKind.ConditionalBranch ||
+                semantic.Flow == VMFlowKind.Leave ||
+                semantic.Flow == VMFlowKind.Switch)
+            {
+                return true;
+            }
+
             switch (mapped)
             {
                 case VMOpCode.Ldarg:
+                case VMOpCode.Ldarga:
+                case VMOpCode.Starg:
                 case VMOpCode.Ldloc:
+                case VMOpCode.Ldloca:
                 case VMOpCode.Stloc:
                 case VMOpCode.Br:
                 case VMOpCode.BrTrue:
@@ -613,18 +626,12 @@ namespace Krypton.Pipeline.Stages
                 return false;
             // Never defer incompatible arithmetic/shift mappings on operand-1 bytes.
             // These tend to be branch/local opcodes in dense Reactor dispatchers.
-            if (mapped == VMOpCode.Add ||
-                mapped == VMOpCode.Sub ||
-                mapped == VMOpCode.Xor ||
-                mapped == VMOpCode.Shl ||
-                mapped == VMOpCode.Shr)
+            if (VMOpCodeCatalog.IsArithmetic(mapped))
             {
                 return false;
             }
 
-            if (mapped != VMOpCode.Conv_I4 &&
-                mapped != VMOpCode.Conv_I8 &&
-                mapped != VMOpCode.Conv_U1)
+            if (!VMOpCodeCatalog.IsConversion(mapped))
             {
                 return false;
             }

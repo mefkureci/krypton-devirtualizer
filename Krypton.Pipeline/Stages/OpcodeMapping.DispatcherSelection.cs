@@ -451,10 +451,14 @@ namespace Krypton.Pipeline.Stages
 
         private bool IsOperandTypeCompatible(VMOpCode opCode, byte operandType)
         {
+            if (VMOpCodeCatalog.TryGet(opCode, out var semantic))
+                return semantic.SupportsOperandType(operandType);
+
             switch (opCode)
             {
                 case VMOpCode.Nop:
                 case VMOpCode.Add:
+                case VMOpCode.Ceq:
                 case VMOpCode.Sub:
                 case VMOpCode.Xor:
                 case VMOpCode.Shl:
@@ -481,6 +485,7 @@ namespace Krypton.Pipeline.Stages
 
                 case VMOpCode.Ldarg:
                 case VMOpCode.Ldloc:
+                case VMOpCode.Ldloca:
                 case VMOpCode.Stloc:
                 case VMOpCode.Ldc_I4:
                 case VMOpCode.Ldstr:
@@ -493,6 +498,11 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.BrTrue:
                 case VMOpCode.BrFalse:
                 case VMOpCode.BrLessThan:
+                case VMOpCode.BrGreaterThan:
+                case VMOpCode.BrLessOrEqual:
+                case VMOpCode.BrGreaterOrEqual:
+                case VMOpCode.BrEqual:
+                case VMOpCode.BrNotEqual:
                 case VMOpCode.Ldsfld:
                 case VMOpCode.Ldfld:
                 case VMOpCode.Stsfld:
@@ -502,6 +512,12 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Stobj:
                 case VMOpCode.Ldtoken:
                     return operandType == 1;
+
+                case VMOpCode.Ldc_R4:
+                    return operandType == 3;
+
+                case VMOpCode.Ldc_R8:
+                    return operandType == 4;
 
                 case VMOpCode.Switch:
                     return operandType == 5;

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
 using dnlib.DotNet;
@@ -78,6 +79,14 @@ namespace Krypton.Runner
                 TryToLoadPdbFromDisk = false,
             });
 
+            // A DynamicMethod's operands often come back without a named scope, and
+            // the only reliable way to say which assembly declares such a type is to
+            // ask the assemblies themselves. The target lists what it references, so
+            // load those first: without them the probe searches a domain that does
+            // not yet contain the declaring assembly and the consumer is left to
+            // guess a scope from the namespace.
+            LoadReferencedAssemblies(runtimeAssembly);
+
             // Trigger bootstrap: access all types which fires their .cctor
             TriggerInitialization(runtimeAssembly, _traceCctors, _traceMethodTokens);
 
@@ -94,6 +103,26 @@ namespace Krypton.Runner
             if (_traceCctors)
                 TraceDynamicMethodSummary(dump.Methods);
             return dump;
+        }
+
+        private static void LoadReferencedAssemblies(Assembly assembly)
+        {
+            var loaded = 0;
+            var failed = 0;
+            foreach (var reference in assembly.GetReferencedAssemblies())
+            {
+                try
+                {
+                    Assembly.Load(reference);
+                    loaded++;
+                }
+                catch
+                {
+                    failed++;
+                }
+            }
+
+            Console.WriteLine($"[Runner] Referenced assemblies loaded: {loaded} ({failed} unavailable).");
         }
 
         // ──────────────────────────────────────────────────────────────
@@ -209,7 +238,10 @@ namespace Krypton.Runner
 
                         if (value is Delegate singleDelegate)
                         {
-                            TryCapture(singleDelegate, fieldKey, -1, dnlibModule, results);
+                            if (IsDynamicDelegate(singleDelegate))
+                                TryCapture(singleDelegate, fieldKey, -1, dnlibModule, results);
+                            else
+                                TryCaptureDirect(singleDelegate, fieldKey, -1, results);
                         }
                         else if (value.GetType().IsArray)
                         {
@@ -218,7 +250,13 @@ namespace Krypton.Runner
                             {
                                 var elem = arr.GetValue(i);
                                 if (elem is Delegate d)
-                                    TryCapture(d, $"{fieldKey}[{i}]", i, dnlibModule, results);
+                                {
+                                    var indexedKey = $"{fieldKey}[{i}]";
+                                    if (IsDynamicDelegate(d))
+                                        TryCapture(d, indexedKey, i, dnlibModule, results);
+                                    else
+                                        TryCaptureDirect(d, indexedKey, i, results);
+                                }
                             }
                         }
                     }
@@ -269,6 +307,71 @@ namespace Krypton.Runner
             {
                 Console.WriteLine($"[Runner]   Failed to read {fieldKey}[{index}]: {ex.Message}");
             }
+        }
+
+        // Some Reactor wrapper fields are delegates bound directly to framework
+        // methods rather than DynamicMethods (e.g. String.Concat and
+        // String.IsNullOrEmpty). Preserve those runtime targets in the same
+        // evidence stream so HiddenCallRecovery can rewrite them without guesses.
+        private static void TryCaptureDirect(
+            Delegate d,
+            string fieldKey,
+            int index,
+            List<DynamicMethodEntry> results)
+        {
+            var method = d == null ? null : d.Method;
+            if (method == null) return;
+
+            var entry = new DynamicMethodEntry
+            {
+                SourceField = fieldKey,
+                SourceIndex = index,
+                ReturnType = DynamicMethodSerializer.GetTypeName(method.ReturnType),
+                MaxStack = 8,
+                InitLocals = true
+            };
+
+            foreach (var p in method.GetParameters())
+                entry.ParameterTypes.Add(DynamicMethodSerializer.GetTypeName(p.ParameterType));
+
+            var parameters = method.GetParameters();
+            var signature = new System.Text.StringBuilder();
+            if (!method.IsStatic) signature.Append("instance ");
+            signature.Append(DynamicMethodSerializer.GetTypeName(method.ReturnType));
+            signature.Append(" (");
+            var paramEntries = new List<ParamEntry>();
+            for (var i = 0; i < parameters.Length; i++)
+            {
+                if (i != 0) signature.Append(", ");
+                var p = parameters[i];
+                var byRef = p.ParameterType.IsByRef;
+                var type = DynamicMethodSerializer.GetTypeName(
+                    byRef ? p.ParameterType.GetElementType() : p.ParameterType);
+                signature.Append(byRef ? type + "&" : type);
+                paramEntries.Add(new ParamEntry { Type = type, IsByRef = byRef });
+            }
+            signature.Append(")");
+
+            entry.Instructions.Add(new InstructionEntry
+            {
+                Offset = 0,
+                Opcode = method.IsStatic ? "call" : "callvirt",
+                OperandKind = "method",
+                DeclType = method.DeclaringType == null ? null : method.DeclaringType.FullName,
+                // The runtime target is right here, so the assembly that declares it
+                // is known exactly. Recording it keeps the consumer from having to
+                // infer a scope from the namespace, which is wrong for every type
+                // whose namespace does not match its assembly.
+                DeclAssembly = method.DeclaringType == null
+                    ? null
+                    : method.DeclaringType.Assembly.GetName().Name,
+                MemberName = method.Name,
+                MemberSig = signature.ToString(),
+                Params = paramEntries
+            });
+            results.Add(entry);
+            Console.WriteLine("[Runner]   Captured direct delegate: " + fieldKey +
+                              " -> " + method.DeclaringType + "::" + method.Name);
         }
 
         /// <summary>

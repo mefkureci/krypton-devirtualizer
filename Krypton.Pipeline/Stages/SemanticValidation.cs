@@ -30,6 +30,207 @@ namespace Krypton.Pipeline.Stages
             var profile = BuildEffectiveProfile(ctx);
             if (!profile.Enabled)
                 return;
+
+            // Metadata signatures and payload operand encoding are the only evidence
+            // here that does not depend on the opcode table, so what they prove is
+            // pinned before any inference runs and is never revisited afterwards.
+            if (IsEnvironmentEnabled("KRYPTON_TYPE_CONSTRAINTS"))
+            {
+                var typeOutcome = TypeConstraintAnchoring.Propagate(ctx);
+                foreach (var line in TypeConstraintAnchoring.FormatSummary(typeOutcome).Split('\n'))
+                    ctx.Options.Logger.Info(line.TrimEnd());
+
+                // Runtime observations belong here: they read the interpreter's actual
+                // behaviour rather than the opcode table, so they are pinned alongside
+                // the metadata anchors and before any search runs. Entries that
+                // contradict what is already proven are rejected, not merged.
+                if (RuntimeTraceAnchors.ConfiguredPath() != null)
+                {
+                    var runtimeAnchors = RuntimeTraceAnchors.Apply(ctx, typeOutcome);
+                    foreach (var line in RuntimeTraceAnchors.FormatSummary(runtimeAnchors).Split('\n'))
+                        ctx.Options.Logger.Info(line.TrimEnd());
+                }
+
+                if (IsEnvironmentEnabled("KRYPTON_INVENTORY_ONLY"))
+                {
+                    var inventorySnapshot = new SoundOpcodeFixpointResult
+                    {
+                        Outcome = typeOutcome,
+                        Families = SoundOpcodeFamilies.Classify(typeOutcome.Candidates),
+                        Rounds = 0
+                    };
+                    var inventoryPath = SoundOpcodeInventory.Write(ctx, inventorySnapshot);
+                    if (!string.IsNullOrWhiteSpace(inventoryPath))
+                        ctx.Options.Logger.Info($"  sound opcode inventory: {inventoryPath}");
+                    return;
+                }
+
+                if (IsEnvironmentEnabled("KRYPTON_GLOBAL_STACK_SOLVER"))
+                {
+                    var solved = GlobalStackConstraintSolver.Solve(ctx, typeOutcome.Candidates);
+                    foreach (var line in GlobalStackConstraintSolver.FormatSummary(solved).Split('\n'))
+                        ctx.Options.Logger.Info(line.TrimEnd());
+
+                    var anchoredCount = 0;
+                    var unresolvedCount = 0;
+                    var inconclusiveCount = 0;
+
+                    foreach (var resolution in solved.Bytes.Values)
+                    {
+                        switch (resolution.Status)
+                        {
+                            case ResolutionStatus.Anchored:
+                                anchoredCount++;
+                                break;
+                            case ResolutionStatus.Unresolved:
+                                unresolvedCount++;
+                                continue;
+                            default:
+                                inconclusiveCount++;
+                                continue;
+                        }
+
+                        // An existing metadata anchor is independent evidence; a
+                        // disagreement is a bug to surface, never something to
+                        // silently overwrite.
+                        if (typeOutcome.Anchors.TryGetValue(resolution.VmByte, out var existing))
+                        {
+                            if (existing.OpCode != resolution.Surviving.First())
+                            {
+                                ctx.Options.Logger.Warning(
+                                    $"INCONSISTENCY: vm 0x{resolution.VmByte:X2} is anchored to {existing.OpCode} by metadata " +
+                                    $"but stack constraints prove {resolution.Surviving.First()}; keeping the metadata anchor.");
+                            }
+
+                            continue;
+                        }
+
+                        var record = new AnchorRecord
+                        {
+                            VmByte = resolution.VmByte,
+                            OpCode = resolution.Surviving.First(),
+                            Source = AnchorSource.CallArgument,
+                            SiteCount = 0,
+                            Round = 0
+                        };
+                        record.Evidence.Add(
+                            "GlobalStackFeasibility: exhaustive whole-method search left exactly one assignment");
+                        foreach (var elimination in resolution.Eliminations)
+                            record.Evidence.Add(elimination);
+                        typeOutcome.Anchors[resolution.VmByte] = record;
+                    }
+
+                    foreach (var anchor in typeOutcome.Anchors.Values)
+                    {
+                        if (!typeOutcome.Candidates.TryGetValue(anchor.VmByte, out var set))
+                            continue;
+                        set.Clear();
+                        set.Add(anchor.OpCode);
+                    }
+
+                    var knownPlaintext = KnownPlaintextCryptoAnchoring.Solve(ctx, typeOutcome.Candidates);
+                    foreach (var known in knownPlaintext)
+                    {
+                        typeOutcome.Candidates[known.VmByte].Clear();
+                        typeOutcome.Candidates[known.VmByte].Add(known.OpCode);
+                        var record = new AnchorRecord
+                        {
+                            VmByte = known.VmByte,
+                            OpCode = known.OpCode,
+                            Source = AnchorSource.KnownPlaintext,
+                            SiteCount = known.Sites,
+                            Round = 0
+                        };
+                        record.Evidence.Add(known.Evidence);
+                        typeOutcome.Anchors[known.VmByte] = record;
+                        ctx.Options.Logger.Info(
+                            $"  [known-plaintext] vm 0x{known.VmByte:X2} -> {known.OpCode}: {known.Evidence}");
+                    }
+
+                    if (knownPlaintext.Count > 0)
+                    {
+                        var cascade = GlobalStackConstraintSolver.Solve(ctx, typeOutcome.Candidates);
+                        var cascadeGains = 0;
+                        foreach (var resolution in cascade.Bytes.Values)
+                        {
+                            if (resolution.Status != ResolutionStatus.Anchored ||
+                                typeOutcome.Anchors.ContainsKey(resolution.VmByte))
+                                continue;
+                            var record = new AnchorRecord
+                            {
+                                VmByte = resolution.VmByte,
+                                OpCode = resolution.Surviving.First(),
+                                Source = AnchorSource.KnownPlaintext,
+                                SiteCount = 0,
+                                Round = 1
+                            };
+                            record.Evidence.Add(
+                                "Cascade after known-plaintext anchors: exhaustive whole-method stack search left one assignment");
+                            foreach (var elimination in resolution.Eliminations)
+                                record.Evidence.Add(elimination);
+                            typeOutcome.Anchors[resolution.VmByte] = record;
+                            cascadeGains++;
+                        }
+                        ctx.Options.Logger.Info(
+                            $"  known-plaintext cascade: +{cascadeGains} anchor(s); total={typeOutcome.Anchors.Count}");
+                    }
+
+                    var fixpoint = SoundOpcodeFixpoint.Run(ctx, typeOutcome);
+                    typeOutcome = fixpoint.Outcome;
+
+                    if (IsEnvironmentEnabled("KRYPTON_JOINT_TARGET_SOLVE"))
+                    {
+                        var jointTargets = (Environment.GetEnvironmentVariable("KRYPTON_JOINT_TARGET_METHODS") ?? string.Empty)
+                            .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                            .Select(n => n.Trim())
+                            .Where(n => n.Length > 0)
+                            .ToArray();
+
+                        if (jointTargets.Length > 0)
+                        {
+                            var joint = TargetedJointSolver.Solve(ctx, typeOutcome.Candidates, jointTargets);
+
+                            foreach (var line in TargetedJointSolver.Format(joint).Split('\n'))
+                                ctx.Options.Logger.Info(line.TrimEnd());
+
+                            foreach (var pair in joint.Proven)
+                            {
+                                if (typeOutcome.Candidates.TryGetValue(pair.Key, out var set) && set.Count > 1)
+                                {
+                                    set.Clear();
+                                    set.Add(pair.Value);
+                                }
+
+                                if (!typeOutcome.Anchors.ContainsKey(pair.Key))
+                                {
+                                    var rec = new AnchorRecord
+                                    {
+                                        VmByte = pair.Key,
+                                        OpCode = pair.Value,
+                                        Source = AnchorSource.CallArgument,
+                                        SiteCount = 0,
+                                        Round = 0
+                                    };
+                                    rec.Evidence.Add(
+                                        "GLOBALLY_PROVEN: unique assignment across the target methods " +
+                                        "under stack, CFG, EH, operand and type constraints");
+                                    typeOutcome.Anchors[pair.Key] = rec;
+                                }
+                            }
+                        }
+                    }
+                    var inventoryPath = SoundOpcodeInventory.Write(ctx, fixpoint);
+                    if (!string.IsNullOrWhiteSpace(inventoryPath))
+                        ctx.Options.Logger.Info($"  sound opcode inventory: {inventoryPath}");
+
+                    ctx.Options.Logger.Info(
+                        $"  resolution states: ANCHORED={anchoredCount} UNRESOLVED={unresolvedCount} INCONCLUSIVE={inconclusiveCount}");
+                }
+
+                if (IsEnvironmentEnabled("KRYPTON_APPLY_TYPE_ANCHORS"))
+                    ApplyTypeAnchors(ctx, typeOutcome);
+            }
+
             var verifiableIlMode = IsVerifiableIlModeEnabled();
 
             var cilEvaluationCache = new Dictionary<string, SemanticEvaluationResult>(StringComparer.Ordinal);
@@ -66,6 +267,11 @@ namespace Krypton.Pipeline.Stages
                     $"Semantic validation found vm issues={initialBaseline.TotalViolations}, cil issues={initialCilBaseline.TotalViolations}, but remapping is disabled by semantic settings.");
                 return;
             }
+
+            // Structural and instance-consumer bootstrap mappings define the baseline
+            // evaluated above.  A later exploratory rollback must restore that baseline,
+            // not the pre-bootstrap mappings that were already proven substantially worse.
+            originalStates.Clear();
 
             var beforeViolations = initialBaseline.TotalViolations;
             var beforeCilIssues = initialCilBaseline.TotalViolations;
@@ -422,6 +628,55 @@ namespace Krypton.Pipeline.Stages
                 $"Semantic validation adjusted {appliedChanges + cilAppliedChanges + entryRetuneChanges + structuralBootstrapChanges + instanceConsumerBootstrapChanges + switchSelectorChanges} vm-byte mapping(s): vm violations {beforeViolations} -> {after.TotalViolations}, cil issues {beforeCilIssues} -> {afterCil.TotalViolations}.");
         }
 
+        private void ApplyTypeAnchors(DevirtualizationCtx ctx, AnchorPropagationResult outcome)
+        {
+            var corrected = 0;
+            foreach (var record in outcome.Anchors.Values.OrderBy(r => r.VmByte))
+            {
+                var vmByte = record.VmByte;
+                var anchor = record.OpCode;
+                ctx.AnchoredOpcodes.Add(vmByte);
+
+                if (ctx.PatternMatcher.IsOpCodeValueKnown(vmByte) &&
+                    ctx.PatternMatcher.GetOpCodeValue(vmByte) == anchor)
+                {
+                    continue;
+                }
+
+                ctx.PatternMatcher.SetOpCodeValue(anchor, vmByte);
+                ctx.OpcodeConfidence ??= new Dictionary<int, OpcodeMappingConfidence>();
+                ctx.OpcodeConfidence[vmByte] = new OpcodeMappingConfidence(anchor, 1.0, "metadata-signature");
+                foreach (var method in ctx.VirtualizedMethods)
+                {
+                    var instructions = method?.MethodBody?.Instructions;
+                    if (instructions == null)
+                        continue;
+                    foreach (var instruction in instructions)
+                    {
+                        if (instruction?.VmByte != vmByte)
+                            continue;
+                        instruction.IsResolved = true;
+                        instruction.OpCode = anchor;
+                    }
+                }
+
+                corrected++;
+                ctx.Options.Logger.Info(
+                    $"Type anchor: vm 0x{vmByte:X2} -> {anchor} (round {record.Round}, {record.SiteCount} sites, {record.Source}).");
+            }
+
+            if (ctx.AnchoredOpcodes.Count > 0)
+            {
+                ctx.Options.Logger.Success(
+                    $"Pinned {ctx.AnchoredOpcodes.Count} metadata-anchored opcode(s); {corrected} corrected an inferred mapping.");
+            }
+        }
+
+        private bool IsAnchored(DevirtualizationCtx ctx, int vmByte)
+        {
+            return ctx?.AnchoredOpcodes != null && ctx.AnchoredOpcodes.Contains(vmByte);
+        }
+
         private int RetuneStructurallyObviousMappings(
             DevirtualizationCtx ctx,
             IDictionary<int, OpcodeMappingSnapshot> originalStates)
@@ -437,6 +692,8 @@ namespace Krypton.Pipeline.Stages
                 {
                     if (!ctx.PatternMatcher.IsOpCodeValueKnown(vmByte))
                         continue;
+                    if (IsAnchored(ctx, vmByte))
+                        continue;
                     if (IsOverrideMapping(ctx, vmByte))
                         continue;
                     if (!TryInferStructurallyObviousOpcode(ctx, vmByte, out var inferred))
@@ -448,6 +705,8 @@ namespace Krypton.Pipeline.Stages
                         MarkStructuralConfidence(ctx, vmByte, inferred);
                         continue;
                     }
+                    if (IsTrustedHandlerFieldMapping(ctx, vmByte, current, inferred))
+                        continue;
                     if (!IsOperandTypeCompatible(ctx, vmByte, inferred))
                         continue;
                     if (!AreCandidateOperandsSemanticallyCompatible(ctx, vmByte, inferred))
@@ -466,6 +725,32 @@ namespace Krypton.Pipeline.Stages
             }
 
             return applied;
+        }
+
+        private bool IsTrustedHandlerFieldMapping(
+            DevirtualizationCtx ctx,
+            int vmByte,
+            VMOpCode current,
+            VMOpCode inferred)
+        {
+            if (!IsFieldAccessOpcode(current) || !IsFieldAccessOpcode(inferred))
+                return false;
+            return ctx.OpcodeConfidence != null &&
+                   ctx.OpcodeConfidence.TryGetValue(vmByte, out var confidence) &&
+                   confidence.Confidence >= 0.9 &&
+                   (confidence.Source ?? string.Empty).IndexOf(
+                       "handler-pattern",
+                       StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private bool IsFieldAccessOpcode(VMOpCode opcode)
+        {
+            return opcode == VMOpCode.Ldfld ||
+                   opcode == VMOpCode.Ldsfld ||
+                   opcode == VMOpCode.Ldflda ||
+                   opcode == VMOpCode.Ldsflda ||
+                   opcode == VMOpCode.Stfld ||
+                   opcode == VMOpCode.Stsfld;
         }
 
         private IEnumerable<int> EnumerateObservedVmBytes(DevirtualizationCtx ctx)
@@ -501,6 +786,11 @@ namespace Krypton.Pipeline.Stages
 
         private void ApplyStructuralChange(DevirtualizationCtx ctx, int vmByte, VMOpCode opcode)
         {
+            // structural-usage is derived: it resolves neighbours through the very
+            // table it is about to write to.
+            if (OpcodeMapping.IsSoundModeEnabled())
+                return;
+
             ctx.PatternMatcher.SetOpCodeValue(opcode, vmByte);
             MarkStructuralConfidence(ctx, vmByte, opcode);
 
@@ -535,6 +825,8 @@ namespace Krypton.Pipeline.Stages
             opcode = VMOpCode.Nop;
 
             if (TryInferMetadataOperandOpcode(ctx, vmByte, out opcode))
+                return true;
+            if (TryInferIntegerConstantOpcode(ctx, vmByte, out opcode))
                 return true;
             if (TryInferIndexOperandOpcode(ctx, vmByte, out opcode))
                 return true;
@@ -576,6 +868,8 @@ namespace Krypton.Pipeline.Stages
 
             if (stats.TypeTokens == stats.Total)
             {
+                if (TryInferTypeTokenContextOpcode(ctx, vmByte, out opcode))
+                    return true;
                 if (LooksLikeNewarrUsage(ctx, vmByte))
                 {
                     opcode = VMOpCode.Newarr;
@@ -583,13 +877,192 @@ namespace Krypton.Pipeline.Stages
                 }
             }
 
-            if (stats.UserStrings == stats.Total)
+            if (stats.UserStrings == stats.Total && !LooksLikeBranchOperandByte(ctx, vmByte))
             {
                 opcode = VMOpCode.Ldstr;
                 return true;
             }
 
             return false;
+        }
+
+        private bool TryInferTypeTokenContextOpcode(DevirtualizationCtx ctx, int vmByte, out VMOpCode opcode)
+        {
+            opcode = VMOpCode.Nop;
+            var total = 0;
+            var ldtoken = 0;
+            var box = 0;
+            var constrained = 0;
+
+            foreach (var method in ctx.VirtualizedMethods)
+            {
+                var instructions = method?.MethodBody?.Instructions;
+                if (instructions == null)
+                    continue;
+
+                for (var i = 0; i + 1 < instructions.Count; i++)
+                {
+                    var instruction = instructions[i];
+                    if (instruction?.VmByte != vmByte || !(instruction.Operand is int))
+                        continue;
+
+                    total++;
+                    if (!(instructions[i + 1]?.Operand is int methodToken))
+                        continue;
+
+                    IMethodDescriptor descriptor;
+                    try
+                    {
+                        descriptor = ctx.Module.LookupMember(methodToken) as IMethodDescriptor;
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        var fullName = descriptor?.FullName ?? string.Empty;
+                        if (fullName.IndexOf("System.Type::GetTypeFromHandle", StringComparison.Ordinal) >= 0)
+                        {
+                            ldtoken++;
+                            continue;
+                        }
+
+                        var signature = descriptor?.Signature ?? descriptor?.Resolve()?.Signature;
+                        if (signature == null)
+                            continue;
+                        if (signature.HasThis && signature.ParameterTypes.Count == 0)
+                        {
+                            constrained++;
+                            continue;
+                        }
+                        if (signature.ParameterTypes.Count > 0 &&
+                            string.Equals(
+                                signature.ParameterTypes[signature.ParameterTypes.Count - 1]?.FullName,
+                                "System.Object",
+                                StringComparison.Ordinal))
+                        {
+                            box++;
+                        }
+                    }
+                    catch
+                    {
+                        // Malformed or non-method member references are not context evidence.
+                    }
+                }
+            }
+
+            if (total == 0)
+                return false;
+            if (ldtoken == total)
+                opcode = VMOpCode.Ldtoken;
+            else if (box == total)
+                opcode = VMOpCode.Box;
+            else if (constrained == total)
+                opcode = VMOpCode.Constrained;
+            else
+                return false;
+            return true;
+        }
+
+        private bool TryInferIntegerConstantOpcode(DevirtualizationCtx ctx, int vmByte, out VMOpCode opcode)
+        {
+            opcode = VMOpCode.Nop;
+            if (!ctx.TryGetOperandType(vmByte, out var operandType) || operandType != 1)
+                return false;
+            if (ctx.PatternMatcher.IsOpCodeValueKnown(vmByte))
+            {
+                var current = ctx.PatternMatcher.GetOpCodeValue(vmByte);
+                if (current != VMOpCode.Ldloc &&
+                    current != VMOpCode.Ldloca &&
+                    current != VMOpCode.Stloc &&
+                    current != VMOpCode.Ldc_I4)
+                {
+                    return false;
+                }
+            }
+
+            var total = 0;
+            var arithmeticNeighbors = 0;
+            var resolvedMetadata = 0;
+            var branchTargets = 0;
+            var invalidLocalIndices = 0;
+            foreach (var method in ctx.VirtualizedMethods)
+            {
+                var instructions = method?.MethodBody?.Instructions;
+                if (instructions == null)
+                    continue;
+
+                for (var i = 0; i < instructions.Count; i++)
+                {
+                    var instruction = instructions[i];
+                    if (instruction?.VmByte != vmByte || !(instruction.Operand is int operand))
+                        continue;
+
+                    total++;
+                    if (operand >= 0 && operand < instructions.Count)
+                        branchTargets++;
+                    var localCount = method?.MethodBody?.Locals?.Count ?? 0;
+                    if (operand < 0 || operand >= localCount)
+                        invalidLocalIndices++;
+                    try
+                    {
+                        if (ctx.Module.LookupMember(operand) != null)
+                            resolvedMetadata++;
+                    }
+                    catch
+                    {
+                        // Non-resolvable metadata-shaped values can be integer immediates.
+                    }
+
+                    var previous = i > 0 ? instructions[i - 1] : null;
+                    var next = i + 1 < instructions.Count ? instructions[i + 1] : null;
+                    if (IsIntegerArithmeticInstruction(ctx, previous) ||
+                        IsIntegerArithmeticInstruction(ctx, next))
+                    {
+                        arithmeticNeighbors++;
+                    }
+                }
+            }
+
+            if (total < 4 || invalidLocalIndices == 0)
+                return false;
+            if (arithmeticNeighbors >= 8)
+            {
+                opcode = VMOpCode.Ldc_I4;
+                return true;
+            }
+            if (resolvedMetadata * 2 >= total || branchTargets * 5 >= total * 4)
+                return false;
+            if (arithmeticNeighbors < 2 && invalidLocalIndices * 2 < total)
+                return false;
+
+            opcode = VMOpCode.Ldc_I4;
+            return true;
+        }
+
+        private bool IsIntegerArithmeticInstruction(DevirtualizationCtx ctx, VMInstruction instruction)
+        {
+            if (instruction == null || !TryResolveOpcode(ctx, instruction, null, out var opcode))
+                return false;
+
+            switch (opcode)
+            {
+                case VMOpCode.Add:
+                case VMOpCode.Sub:
+                case VMOpCode.Xor:
+                case VMOpCode.Shl:
+                case VMOpCode.Shr:
+                case VMOpCode.Neg:
+                case VMOpCode.Not:
+                case VMOpCode.Conv_I4:
+                case VMOpCode.Conv_I8:
+                case VMOpCode.Conv_U1:
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         private OperandKindStats CollectOperandKindStats(DevirtualizationCtx ctx, int vmByte)
@@ -667,6 +1140,12 @@ namespace Krypton.Pipeline.Stages
             if (stats.Total == 0)
                 return false;
 
+            if (stats.LocalLike == stats.Total && LooksLikeLocalAddressUsage(ctx, vmByte))
+            {
+                opcode = VMOpCode.Ldloca;
+                return true;
+            }
+
             if (stats.ArgLike == stats.Total && stats.Total >= 2)
             {
                 opcode = VMOpCode.Ldarg;
@@ -689,6 +1168,57 @@ namespace Krypton.Pipeline.Stages
             }
 
             return false;
+        }
+
+        private bool LooksLikeLocalAddressUsage(DevirtualizationCtx ctx, int vmByte)
+        {
+            var strongEvidence = 0;
+            foreach (var method in ctx.VirtualizedMethods)
+            {
+                var instructions = method?.MethodBody?.Instructions;
+                var locals = method?.MethodBody?.Locals;
+                if (instructions == null || locals == null)
+                    continue;
+
+                for (var i = 0; i + 1 < instructions.Count; i++)
+                {
+                    var instruction = instructions[i];
+                    if (instruction?.VmByte != vmByte ||
+                        !(instruction.Operand is int localIndex) ||
+                        localIndex < 0 ||
+                        localIndex >= locals.Count)
+                    {
+                        continue;
+                    }
+
+                    var next = instructions[i + 1];
+                    if (next == null)
+                        continue;
+                    if (TryInferTypeTokenContextOpcode(ctx, next.VmByte, out var tokenOpcode) &&
+                        tokenOpcode == VMOpCode.Constrained)
+                    {
+                        strongEvidence++;
+                        continue;
+                    }
+                    if (!(next.Operand is int methodToken))
+                        continue;
+
+                    try
+                    {
+                        var descriptor = ctx.Module.LookupMember(methodToken) as IMethodDescriptor;
+                        var signature = descriptor?.Signature ?? descriptor?.Resolve()?.Signature;
+                        var declaringType = descriptor?.DeclaringType?.Resolve();
+                        if (signature?.HasThis == true && declaringType?.IsValueType == true)
+                            strongEvidence++;
+                    }
+                    catch
+                    {
+                        // Unresolvable call sites do not contribute structural evidence.
+                    }
+                }
+            }
+
+            return strongEvidence >= 2;
         }
 
         private IndexUsageStats CollectIndexUsageStats(DevirtualizationCtx ctx, int vmByte)
@@ -895,11 +1425,208 @@ namespace Krypton.Pipeline.Stages
             return conditionalUses > 0 && conditionalUses * 2 >= total;
         }
 
+
+        // Detects the operandless VM byte that terminates an "array[index] = value"
+        // statement. Reactor's integrity blob is built with hundreds of these in a
+        // row, and every existing array detector is scoped to small structural
+        // methods, so a byte used only inside a large method is invisible to them.
+        // Getting this wrong is unusually destructive: the correct opcode pops 3 and
+        // pushes nothing, while the arithmetic opcodes it gets confused with pop 2
+        // and push 1, so each occurrence leaks two stack slots.
+        private bool LooksLikeArrayStoreUsage(DevirtualizationCtx ctx, int vmByte, out VMOpCode opcode)
+        {
+            opcode = VMOpCode.Stelem_I1;
+            var total = 0;
+            var storeLike = 0;
+            var referenceValues = 0;
+
+            foreach (var method in ctx.VirtualizedMethods)
+            {
+                var instructions = method?.MethodBody?.Instructions;
+                if (instructions == null)
+                    continue;
+
+                var expectedReturn = ResolveExpectedReturnStack(method);
+                for (var i = 0; i < instructions.Count; i++)
+                {
+                    if (instructions[i]?.VmByte != vmByte)
+                        continue;
+
+                    total++;
+                    if (i < 2)
+                        continue;
+
+                    // A store terminates a statement, so whatever follows must begin
+                    // a new one rather than consume a produced value.
+                    if (i + 1 < instructions.Count &&
+                        (!TryResolveOpcode(ctx, instructions[i + 1], null, out var follower) ||
+                         !StartsNewStatement(follower)))
+                    {
+                        continue;
+                    }
+
+                    // Walk back to a "load array, push index" pair and require the
+                    // window between it and this byte to leave exactly three values.
+                    for (var j = i - 2; j >= 0 && j >= i - 10; j--)
+                    {
+                        if (!TryResolveOpcode(ctx, instructions[j], null, out var arrayLoad) ||
+                            !IsArrayReferenceLoad(arrayLoad))
+                        {
+                            continue;
+                        }
+                        if (!TryResolveOpcode(ctx, instructions[j + 1], null, out var indexPush) ||
+                            indexPush != VMOpCode.Ldc_I4)
+                        {
+                            continue;
+                        }
+
+                        if (!TryMeasureWindowDepth(ctx, method, instructions, j, i, expectedReturn, out var depth))
+                            break;
+                        if (depth != 3)
+                            break;
+
+                        storeLike++;
+                        if (TryResolveOpcode(ctx, instructions[i - 1], null, out var valueOpcode) &&
+                            IsReferenceProducingOpcode(valueOpcode))
+                        {
+                            referenceValues++;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (total < 8 || storeLike < 8 || storeLike * 2 < total)
+                return false;
+
+            opcode = referenceValues * 2 >= storeLike ? VMOpCode.Stelem_Ref : VMOpCode.Stelem_I1;
+            return true;
+        }
+
+        private bool TryMeasureWindowDepth(
+            DevirtualizationCtx ctx,
+            VMMethod method,
+            IList<VMInstruction> instructions,
+            int start,
+            int end,
+            int expectedReturn,
+            out int depth)
+        {
+            depth = 0;
+            for (var k = start; k < end; k++)
+            {
+                if (!TryResolveOpcode(ctx, instructions[k], null, out var opcode))
+                    return false;
+                if (IsControlFlowOpcode(opcode))
+                    return false;
+                if (!TryGetStackEffect(opcode, instructions[k].Operand, ctx.Module, expectedReturn, out var pop, out var push))
+                    return false;
+
+                depth -= pop;
+                if (depth < 0)
+                    return false;
+                depth += push;
+                if (depth > 64)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private bool IsArrayReferenceLoad(VMOpCode opcode)
+        {
+            return opcode == VMOpCode.Ldloc ||
+                   opcode == VMOpCode.Ldarg ||
+                   opcode == VMOpCode.Ldsfld ||
+                   opcode == VMOpCode.Ldfld;
+        }
+
+        private bool StartsNewStatement(VMOpCode opcode)
+        {
+            switch (opcode)
+            {
+                case VMOpCode.Ldloc:
+                case VMOpCode.Ldarg:
+                case VMOpCode.Ldc_I4:
+                case VMOpCode.Ldsfld:
+                case VMOpCode.Ldsflda:
+                case VMOpCode.Ldfld:
+                case VMOpCode.Ldflda:
+                case VMOpCode.Ldstr:
+                case VMOpCode.Ldnull:
+                case VMOpCode.Ldtoken:
+                case VMOpCode.Ldloca:
+                case VMOpCode.Newobj:
+                case VMOpCode.Call:
+                case VMOpCode.Callvirt:
+                case VMOpCode.Nop:
+                case VMOpCode.Ret:
+                case VMOpCode.Leave:
+                case VMOpCode.Br:
+                case VMOpCode.EndFinally:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private bool IsReferenceProducingOpcode(VMOpCode opcode)
+        {
+            switch (opcode)
+            {
+                case VMOpCode.Ldstr:
+                case VMOpCode.Ldnull:
+                case VMOpCode.Newobj:
+                case VMOpCode.Newarr:
+                case VMOpCode.Box:
+                case VMOpCode.Ldelem_Ref:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private bool IsControlFlowOpcode(VMOpCode opcode)
+        {
+            switch (opcode)
+            {
+                case VMOpCode.Br:
+                case VMOpCode.BrTrue:
+                case VMOpCode.BrFalse:
+                case VMOpCode.BrLessThan:
+                case VMOpCode.BrGreaterThan:
+                case VMOpCode.BrLessOrEqual:
+                case VMOpCode.BrGreaterOrEqual:
+                case VMOpCode.BrEqual:
+                case VMOpCode.BrNotEqual:
+                case VMOpCode.Switch:
+                case VMOpCode.Leave:
+                case VMOpCode.Ret:
+                case VMOpCode.EndFinally:
+                    return true;
+                default:
+                    return false;
+            }
+        }
         private bool TryInferArrayAndStackOpcode(DevirtualizationCtx ctx, int vmByte, out VMOpCode opcode)
         {
             opcode = VMOpCode.Nop;
             if (!ctx.TryGetOperandType(vmByte, out var operandType) || operandType != 0)
                 return false;
+
+            // Runs first: a mis-typed array store corrupts the stack for every
+            // instruction after it, so it must win over the weaker shape guesses.
+            if (LooksLikeArrayStoreUsage(ctx, vmByte, out var arrayStore))
+            {
+                opcode = arrayStore;
+                return true;
+            }
+
+            if (LooksLikeNopAfterVoidCallUsage(ctx, vmByte))
+            {
+                opcode = VMOpCode.Nop;
+                return true;
+            }
 
             if (LooksLikeLdlenUsage(ctx, vmByte))
             {
@@ -934,6 +1661,61 @@ namespace Krypton.Pipeline.Stages
             }
 
             return false;
+        }
+
+        private bool LooksLikeNopAfterVoidCallUsage(DevirtualizationCtx ctx, int vmByte)
+        {
+            var total = 0;
+            var afterVoidCall = 0;
+            var afterVoidCallWithSuccessor = 0;
+
+            foreach (var method in ctx.VirtualizedMethods)
+            {
+                var instructions = method?.MethodBody?.Instructions;
+                if (instructions == null)
+                    continue;
+
+                for (var i = 0; i < instructions.Count; i++)
+                {
+                    if (instructions[i]?.VmByte != vmByte)
+                        continue;
+
+                    total++;
+                    if (i == 0)
+                        continue;
+
+                    var previous = instructions[i - 1];
+                    if (!TryResolveOpcode(ctx, previous, null, out var previousOpcode) ||
+                        (previousOpcode != VMOpCode.Call && previousOpcode != VMOpCode.Callvirt))
+                    {
+                        continue;
+                    }
+
+                    if (!TryGetStackEffect(
+                            previousOpcode,
+                            previous.Operand,
+                            ctx.Module,
+                            ResolveExpectedReturnStack(method),
+                            out _,
+                            out var push) ||
+                        push != 0)
+                    {
+                        continue;
+                    }
+
+                    afterVoidCall++;
+                    if (i + 1 < instructions.Count)
+                        afterVoidCallWithSuccessor++;
+                }
+            }
+
+            // A stack-consuming opcode cannot legally follow a void call when no
+            // value is produced. Repeated non-terminal occurrences also rule out
+            // ret/endfinally, leaving the VM's operandless no-op as the safe shape.
+            return total >= 8 &&
+                   afterVoidCall >= 4 &&
+                   afterVoidCallWithSuccessor >= 2 &&
+                   afterVoidCall * 5 >= total;
         }
 
         private bool LooksLikePopUsage(DevirtualizationCtx ctx, int vmByte)
@@ -1523,7 +2305,10 @@ namespace Krypton.Pipeline.Stages
             {
                 case VMOpCode.Ldarg:
                 case VMOpCode.Ldloc:
+                case VMOpCode.Ldloca:
                 case VMOpCode.Ldc_I4:
+                case VMOpCode.Ldc_R4:
+                case VMOpCode.Ldc_R8:
                 case VMOpCode.Dup:
                 case VMOpCode.Conv_I4:
                 case VMOpCode.Conv_I8:
@@ -1676,6 +2461,9 @@ namespace Krypton.Pipeline.Stages
             int baselineViolations,
             bool suspicious)
         {
+            if (IsAnchored(ctx, vmByte))
+                return false;
+
             if (suspicious)
                 return true;
             if (!IsOperandTypeCompatible(ctx, vmByte, current))
@@ -1709,6 +2497,44 @@ namespace Krypton.Pipeline.Stages
             return looksInference || confidence.Confidence < profile.LowConfidenceThreshold;
         }
 
+        private bool IsVmDelegateConstructionCall(DevirtualizationCtx ctx, IList<VMInstruction> instructions, int index)
+        {
+            // Delegate construction virtualizes as an ordinary Call to the target
+            // method immediately followed by Newobj on the delegate type. At the
+            // VM level that Call never actually invokes anything -- it takes the
+            // method's function pointer -- so it must be scored as a push, not
+            // against the target method's real (this + args) pop count.
+            if (index + 1 >= instructions.Count)
+                return false;
+
+            var next = instructions[index + 1];
+            if (!TryResolveOpcode(ctx, next, null, out var nextOpcode) || nextOpcode != VMOpCode.Newobj)
+                return false;
+            if (!(next.Operand is int ctorToken))
+                return false;
+
+            try
+            {
+                if (!(ctx.Module.LookupMember(ctorToken) is IMethodDescriptor ctor) ||
+                    !string.Equals(ctor.Name, ".ctor", StringComparison.Ordinal))
+                {
+                    return false;
+                }
+
+                var parameters = ctor.Signature?.ParameterTypes;
+                if (parameters == null || parameters.Count != 2)
+                    return false;
+
+                return string.Equals(parameters[0].FullName, "System.Object", StringComparison.Ordinal) &&
+                       (string.Equals(parameters[1].FullName, "System.IntPtr", StringComparison.Ordinal) ||
+                        string.Equals(parameters[1].FullName, "System.UIntPtr", StringComparison.Ordinal));
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         public bool HasReachableEntryUnderflow(DevirtualizationCtx ctx, VMMethod method)
         {
             if (ctx?.PatternMatcher == null || ctx.GetOperandTypes().Length == 0 || method?.MethodBody?.Instructions == null)
@@ -1720,37 +2546,28 @@ namespace Krypton.Pipeline.Stages
 
             var profile = BuildEffectiveProfile(ctx);
             var expectedReturn = ResolveExpectedReturnStack(method);
-            var states = new HashSet<int>[instructions.Count];
-            for (var i = 0; i < states.Length; i++)
-                states[i] = new HashSet<int>();
+            var worklist = new BoundedStateWorklist(instructions.Count, profile.MaxStatesPerInstruction);
+            worklist.TryEnqueue(0, 0);
 
-            var queue = new Queue<(int index, int depth)>();
-            queue.Enqueue((0, 0));
-
-            while (queue.Count > 0)
+            while (worklist.TryDequeue(out var index, out var depth))
             {
-                var (index, depth) = queue.Dequeue();
-                if (index < 0 || index >= instructions.Count)
-                    continue;
-
-                var seen = states[index];
-                if (seen.Contains(depth))
-                    continue;
-                if (seen.Count >= profile.MaxStatesPerInstruction)
-                    continue;
-                seen.Add(depth);
-
                 var instruction = instructions[index];
                 if (!TryResolveOpcode(ctx, instruction, null, out var opcode))
                 {
-                    EnqueueIfValid(queue, index + 1, depth, instructions.Count);
+                    worklist.TryEnqueue(index + 1, depth);
                     continue;
                 }
 
                 if (!TryGetStackEffect(opcode, instruction.Operand, ctx.Module, expectedReturn, out var pop, out var push))
                 {
-                    EnqueueIfValid(queue, index + 1, depth, instructions.Count);
+                    worklist.TryEnqueue(index + 1, depth);
                     continue;
+                }
+
+                if (opcode == VMOpCode.Call && IsVmDelegateConstructionCall(ctx, instructions, index))
+                {
+                    pop = 0;
+                    push = 1;
                 }
 
                 if (depth < pop)
@@ -1779,17 +2596,26 @@ namespace Krypton.Pipeline.Stages
                     {
                         if (!TryReadTarget(instruction.Operand, instructions.Count, out var target))
                             continue;
-                        EnqueueIfValid(queue, target, nextDepth, instructions.Count);
+                        worklist.TryEnqueue(target, nextDepth);
                         break;
                     }
                     case VMOpCode.BrTrue:
                     case VMOpCode.BrFalse:
                     case VMOpCode.BrLessThan:
+                    case VMOpCode.BrGreaterThan:
+                    case VMOpCode.BrLessOrEqual:
+                    case VMOpCode.BrGreaterOrEqual:
+                    case VMOpCode.BrEqual:
+                    case VMOpCode.BrNotEqual:
+                    case VMOpCode.BrLessThan_Un:
+                    case VMOpCode.BrGreaterThan_Un:
+                    case VMOpCode.BrLessOrEqual_Un:
+                    case VMOpCode.BrGreaterOrEqual_Un:
                     {
                         if (!TryReadTarget(instruction.Operand, instructions.Count, out var target))
                             continue;
-                        EnqueueIfValid(queue, target, nextDepth, instructions.Count);
-                        EnqueueIfValid(queue, fallThrough, nextDepth, instructions.Count);
+                        worklist.TryEnqueue(target, nextDepth);
+                        worklist.TryEnqueue(fallThrough, nextDepth);
                         break;
                     }
                     case VMOpCode.Switch:
@@ -1797,15 +2623,17 @@ namespace Krypton.Pipeline.Stages
                         if (!(instruction.Operand is int[] targets) || targets.Length == 0)
                             continue;
                         foreach (var target in targets)
-                            EnqueueIfValid(queue, target, nextDepth, instructions.Count);
-                        EnqueueIfValid(queue, fallThrough, nextDepth, instructions.Count);
+                            worklist.TryEnqueue(target, nextDepth);
+                        worklist.TryEnqueue(fallThrough, nextDepth);
                         break;
                     }
                     case VMOpCode.Ret:
                     case VMOpCode.EndFinally:
+                    case VMOpCode.Throw:
+                    case VMOpCode.Rethrow:
                         break;
                     default:
-                        EnqueueIfValid(queue, fallThrough, nextDepth, instructions.Count);
+                        worklist.TryEnqueue(fallThrough, nextDepth);
                         break;
                 }
             }
@@ -1814,6 +2642,14 @@ namespace Krypton.Pipeline.Stages
         }
 
         private IReadOnlyCollection<VMOpCode> BuildCandidates(DevirtualizationCtx ctx, int vmByte)
+        {
+            ctx.TryGetOperandType(vmByte, out var operandType);
+            return VMOpCodeCatalog.GetCandidates(operandType)
+                .Where(candidate => AreCandidateOperandsSemanticallyCompatible(ctx, vmByte, candidate))
+                .ToArray();
+        }
+
+        private IReadOnlyCollection<VMOpCode> BuildLegacyCandidates(DevirtualizationCtx ctx, int vmByte)
         {
             ctx.TryGetOperandType(vmByte, out var operandType);
             var logCandidates = string.Equals(
@@ -1825,7 +2661,7 @@ namespace Krypton.Pipeline.Stages
                 case 0:
                     return new[]
                     {
-                        VMOpCode.Nop,
+                        VMOpCode.Nop, VMOpCode.Ldnull,
                         VMOpCode.Pop, VMOpCode.Dup, VMOpCode.Conv_I4, VMOpCode.Conv_I8, VMOpCode.Conv_U1,
                         VMOpCode.Not, VMOpCode.Neg, VMOpCode.Add, VMOpCode.Sub, VMOpCode.Xor, VMOpCode.Shl, VMOpCode.Shr
                     };
@@ -1855,6 +2691,8 @@ namespace Krypton.Pipeline.Stages
                             VMOpCode.Stfld,
                             VMOpCode.Stsfld,
                             VMOpCode.Unbox_Any,
+                            VMOpCode.Box,
+                            VMOpCode.Constrained,
                             VMOpCode.Newarr,
                             VMOpCode.Ldobj,
                             VMOpCode.Stobj,
@@ -1915,9 +2753,16 @@ namespace Krypton.Pipeline.Stages
 
         private void ApplyChanges(DevirtualizationCtx ctx, IDictionary<int, VMOpCode?> changes, bool logChanges = true)
         {
+            // semantic-validator-remap is derived: the candidate it installs was
+            // chosen by measuring the current table against itself.
+            if (OpcodeMapping.IsSoundModeEnabled())
+                return;
+
             foreach (var pair in changes)
             {
                 var vmByte = pair.Key;
+                if (IsAnchored(ctx, vmByte))
+                    continue;
                 var newOpCode = pair.Value;
                 if (!newOpCode.HasValue)
                 {
@@ -1978,36 +2823,21 @@ namespace Krypton.Pipeline.Stages
                 return;
 
             var expectedReturn = ResolveExpectedReturnStack(method);
-            var states = new HashSet<int>[instructions.Count];
-            for (var i = 0; i < states.Length; i++)
-                states[i] = new HashSet<int>();
+            var worklist = new BoundedStateWorklist(instructions.Count, profile.MaxStatesPerInstruction);
+            worklist.TryEnqueue(0, 0);
 
-            var queue = new Queue<(int index, int depth)>();
-            queue.Enqueue((0, 0));
-
-            while (queue.Count > 0)
+            while (worklist.TryDequeue(out var index, out var depth))
             {
-                var (index, depth) = queue.Dequeue();
-                if (index < 0 || index >= instructions.Count)
-                    continue;
-
-                var seen = states[index];
-                if (seen.Contains(depth))
-                    continue;
-                if (seen.Count >= profile.MaxStatesPerInstruction)
-                    continue;
-                seen.Add(depth);
-
                 var instruction = instructions[index];
                 if (!TryResolveOpcode(ctx, instruction, substitutions, out var opcode))
                 {
-                    EnqueueIfValid(queue, index + 1, depth, instructions.Count);
+                    worklist.TryEnqueue(index + 1, depth);
                     continue;
                 }
 
                 if (!TryGetStackEffect(opcode, instruction.Operand, ctx.Module, expectedReturn, out var pop, out var push))
                 {
-                    EnqueueIfValid(queue, index + 1, depth, instructions.Count);
+                    worklist.TryEnqueue(index + 1, depth);
                     continue;
                 }
 
@@ -2039,20 +2869,29 @@ namespace Krypton.Pipeline.Stages
                             RegisterViolation(result, instruction.VmByte);
                             break;
                         }
-                        EnqueueIfValid(queue, target, nextDepth, instructions.Count);
+                        worklist.TryEnqueue(target, nextDepth);
                         break;
                     }
                     case VMOpCode.BrTrue:
                     case VMOpCode.BrFalse:
                     case VMOpCode.BrLessThan:
+                    case VMOpCode.BrGreaterThan:
+                    case VMOpCode.BrLessOrEqual:
+                    case VMOpCode.BrGreaterOrEqual:
+                    case VMOpCode.BrEqual:
+                    case VMOpCode.BrNotEqual:
+                    case VMOpCode.BrLessThan_Un:
+                    case VMOpCode.BrGreaterThan_Un:
+                    case VMOpCode.BrLessOrEqual_Un:
+                    case VMOpCode.BrGreaterOrEqual_Un:
                     {
                         if (!TryReadTarget(instruction.Operand, instructions.Count, out var target))
                         {
                             RegisterViolation(result, instruction.VmByte);
                             break;
                         }
-                        EnqueueIfValid(queue, target, nextDepth, instructions.Count);
-                        EnqueueIfValid(queue, fallThrough, nextDepth, instructions.Count);
+                        worklist.TryEnqueue(target, nextDepth);
+                        worklist.TryEnqueue(fallThrough, nextDepth);
                         break;
                     }
                     case VMOpCode.Switch:
@@ -2070,18 +2909,20 @@ namespace Krypton.Pipeline.Stages
                                 validTargets = false;
                                 continue;
                             }
-                            EnqueueIfValid(queue, target, nextDepth, instructions.Count);
+                            worklist.TryEnqueue(target, nextDepth);
                         }
                         if (!validTargets)
                             RegisterViolation(result, instruction.VmByte);
-                        EnqueueIfValid(queue, fallThrough, nextDepth, instructions.Count);
+                        worklist.TryEnqueue(fallThrough, nextDepth);
                         break;
                     }
                     case VMOpCode.Ret:
                     case VMOpCode.EndFinally:
+                    case VMOpCode.Throw:
+                    case VMOpCode.Rethrow:
                         break;
                     default:
-                        EnqueueIfValid(queue, fallThrough, nextDepth, instructions.Count);
+                        worklist.TryEnqueue(fallThrough, nextDepth);
                         break;
                 }
             }
@@ -2254,13 +3095,6 @@ namespace Krypton.Pipeline.Stages
             return argLike * 10 >= total * 7;
         }
 
-        private void EnqueueIfValid(Queue<(int index, int depth)> queue, int index, int depth, int count)
-        {
-            if (index < 0 || index >= count)
-                return;
-            queue.Enqueue((index, depth));
-        }
-
         private bool TryResolveOpcode(
             DevirtualizationCtx ctx,
             VMInstruction instruction,
@@ -2363,10 +3197,13 @@ namespace Krypton.Pipeline.Stages
         {
             if (ctx == null || !ctx.TryGetOperandType(vmByte, out var operandType))
                 return true;
+            if (VMOpCodeCatalog.TryGet(opCode, out var semantic))
+                return semantic.SupportsOperandType(operandType);
             switch (opCode)
             {
                 case VMOpCode.Nop:
                 case VMOpCode.Add:
+                case VMOpCode.Ceq:
                 case VMOpCode.Sub:
                 case VMOpCode.Xor:
                 case VMOpCode.Shl:
@@ -2393,6 +3230,7 @@ namespace Krypton.Pipeline.Stages
 
                 case VMOpCode.Ldarg:
                 case VMOpCode.Ldloc:
+                case VMOpCode.Ldloca:
                 case VMOpCode.Stloc:
                 case VMOpCode.Ldc_I4:
                 case VMOpCode.Ldstr:
@@ -2401,10 +3239,17 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Newobj:
                 case VMOpCode.Newarr:
                 case VMOpCode.Unbox_Any:
+                case VMOpCode.Box:
+                case VMOpCode.Constrained:
                 case VMOpCode.Br:
                 case VMOpCode.BrTrue:
                 case VMOpCode.BrFalse:
                 case VMOpCode.BrLessThan:
+                case VMOpCode.BrGreaterThan:
+                case VMOpCode.BrLessOrEqual:
+                case VMOpCode.BrGreaterOrEqual:
+                case VMOpCode.BrEqual:
+                case VMOpCode.BrNotEqual:
                 case VMOpCode.Ldsfld:
                 case VMOpCode.Ldfld:
                 case VMOpCode.Stsfld:
@@ -2413,6 +3258,12 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Ldobj:
                 case VMOpCode.Stobj:
                     return operandType == 1;
+
+                case VMOpCode.Ldc_R4:
+                    return operandType == 3;
+
+                case VMOpCode.Ldc_R8:
+                    return operandType == 4;
 
                 case VMOpCode.Switch:
                     return operandType == 5;
@@ -2464,6 +3315,49 @@ namespace Krypton.Pipeline.Stages
             int localCount,
             int argumentCount)
         {
+            var semantic = VMOpCodeCatalog.Get(candidate);
+            if (semantic.Flow == VMFlowKind.UnconditionalBranch ||
+                semantic.Flow == VMFlowKind.ConditionalBranch)
+            {
+                if (!(operand is int target) || target < 0 || target >= instructionCount)
+                    return false;
+            }
+            if (semantic.Flow == VMFlowKind.Leave && operand != null &&
+                (!(operand is int validatedLeaveTarget) ||
+                 validatedLeaveTarget < 0 ||
+                 validatedLeaveTarget >= instructionCount))
+            {
+                return false;
+            }
+
+            switch (semantic.TokenKind)
+            {
+                case VMMetadataTokenKind.Method:
+                    if (!TryResolveMethodToken(ctx, operand))
+                        return false;
+                    break;
+                case VMMetadataTokenKind.Field:
+                    if (!TryResolveFieldToken(ctx, operand))
+                        return false;
+                    break;
+                case VMMetadataTokenKind.Type:
+                    if (!TryResolveTypeToken(ctx, operand))
+                        return false;
+                    break;
+                case VMMetadataTokenKind.String:
+                    if (!TryResolveUserString(ctx, operand))
+                        return false;
+                    break;
+                case VMMetadataTokenKind.Any:
+                    if (!TryResolveFieldToken(ctx, operand) &&
+                        !TryResolveTypeToken(ctx, operand) &&
+                        !TryResolveMethodToken(ctx, operand))
+                    {
+                        return false;
+                    }
+                    break;
+            }
+
             switch (candidate)
             {
                 case VMOpCode.Br:
@@ -2482,12 +3376,15 @@ namespace Krypton.Pipeline.Stages
                            leaveTarget < instructionCount;
 
                 case VMOpCode.Ldloc:
+                case VMOpCode.Ldloca:
                 case VMOpCode.Stloc:
                     return operand is int localIndex &&
                            localIndex >= 0 &&
                            localIndex < localCount;
 
                 case VMOpCode.Ldarg:
+                case VMOpCode.Ldarga:
+                case VMOpCode.Starg:
                     return operand is int argIndex &&
                            argIndex >= 0 &&
                            argIndex < argumentCount;
@@ -2520,6 +3417,8 @@ namespace Krypton.Pipeline.Stages
 
                 case VMOpCode.Newarr:
                 case VMOpCode.Unbox_Any:
+                case VMOpCode.Box:
+                case VMOpCode.Constrained:
                 case VMOpCode.Ldobj:
                 case VMOpCode.Stobj:
                 case VMOpCode.Ldelema:
@@ -2684,6 +3583,9 @@ namespace Krypton.Pipeline.Stages
 
         private bool ShouldTouchCilMapping(DevirtualizationCtx ctx, int vmByte)
         {
+            if (IsAnchored(ctx, vmByte))
+                return false;
+
             if (ctx?.PatternMatcher == null || !ctx.PatternMatcher.IsOpCodeValueKnown(vmByte))
                 return false;
 
@@ -2800,17 +3702,28 @@ namespace Krypton.Pipeline.Stages
                     continue;
 
                 var instructions = method.MethodBody.Instructions;
-                var limit = Math.Min(96, instructions.Count);
+                var limit = Math.Min(24, instructions.Count);
                 for (var i = 0; i < limit; i++)
                 {
                     var vmByte = instructions[i].VmByte;
                     if (!ctx.PatternMatcher.IsOpCodeValueKnown(vmByte))
                         continue;
-                    if (!ctx.TryGetOperandType(vmByte, out var operandType) || operandType != 1)
+                    if (!ctx.TryGetOperandType(vmByte, out var operandType))
                         continue;
 
                     var mapped = ctx.PatternMatcher.GetOpCodeValue(vmByte);
-                    if (!IsBranchLikeOpcode(mapped) && !branchLikeBytes.Contains(vmByte))
+                    var stackConsumingOperandless = operandType == 0 &&
+                        TryGetStackEffect(
+                            mapped,
+                            instructions[i].Operand,
+                            ctx.Module,
+                            ResolveExpectedReturnStack(method),
+                            out var pop,
+                            out _) &&
+                        pop > 0;
+                    var branchCandidate = operandType == 1 &&
+                        (IsBranchLikeOpcode(mapped) || branchLikeBytes.Contains(vmByte));
+                    if (!stackConsumingOperandless && !branchCandidate)
                         continue;
 
                     if (added.Add(vmByte))
@@ -2842,6 +3755,9 @@ namespace Krypton.Pipeline.Stages
 
         private bool ShouldTouchEntryUnderflowMapping(DevirtualizationCtx ctx, int vmByte)
         {
+            if (IsAnchored(ctx, vmByte))
+                return false;
+
             if (ctx?.PatternMatcher == null || !ctx.PatternMatcher.IsOpCodeValueKnown(vmByte))
                 return false;
 
@@ -2853,6 +3769,30 @@ namespace Krypton.Pipeline.Stages
                     return false;
                 if (IsStructuralConfidence(confidence))
                     return false;
+
+                // Flattened VM control flow deliberately carries dispatcher state
+                // across branches. Entry-only stack analysis cannot model that state
+                // and used to "repair" a well-supported conditional branch into
+                // Leave merely because Leave pops nothing. Preserve a high-confidence
+                // stack-derived branch when its operands consistently point at real
+                // instruction targets; later full-body validation can still reject an
+                // actually malformed recompiled method.
+                var current = ctx.PatternMatcher.GetOpCodeValue(vmByte);
+                if (confidence.Confidence >= 0.90 &&
+                    source.IndexOf("stack-consistency", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                    IsBranchLikeOpcode(current) &&
+                    current != VMOpCode.Leave &&
+                    LooksLikeBranchOperandByte(ctx, vmByte))
+                {
+                    return false;
+                }
+            }
+
+            if (ctx.TryGetOperandType(vmByte, out var stackOperandType) && stackOperandType == 0)
+            {
+                var current = ctx.PatternMatcher.GetOpCodeValue(vmByte);
+                if (TryGetStackEffect(current, null, ctx.Module, 0, out var pop, out _) && pop > 0)
+                    return true;
             }
 
             if (ctx.TryGetOperandType(vmByte, out var operandType) && operandType == 1)
@@ -2889,6 +3829,7 @@ namespace Krypton.Pipeline.Stages
             else if (ctx.TryGetOperandType(vmByte, out operandType) && operandType == 0)
             {
                 candidates.Add(VMOpCode.Nop);
+                candidates.Add(VMOpCode.Ldnull);
                 candidates.Add(VMOpCode.Pop);
                 candidates.Add(VMOpCode.Dup);
                 candidates.Add(VMOpCode.Add);
@@ -2941,9 +3882,12 @@ namespace Krypton.Pipeline.Stages
             var recompileFailurePenalty = ReadPositiveIntFromEnvironment(
                 "KRYPTON_RECOMPILE_FAILURE_PENALTY",
                 5000);
+            var logProgress = IsEnvironmentEnabled("KRYPTON_LOG_SEMANTIC_PROGRESS");
+            var methodIndex = 0;
 
             foreach (var method in ctx.VirtualizedMethods)
             {
+                methodIndex++;
                 if (method?.MethodBody?.Instructions == null || method.MethodBody.Instructions.Count == 0)
                     continue;
                 if (method.MethodBody.Instructions.Any(q => !q.IsResolved))
@@ -2954,8 +3898,23 @@ namespace Krypton.Pipeline.Stages
 
                 try
                 {
+                    if (logProgress)
+                    {
+                        ctx.Options.Logger.Info(
+                            $"[semantic-cil] method {methodIndex}/{ctx.VirtualizedMethods.Count} begin: {method.Parent?.FullName ?? "<unknown>"} (vm={method.MethodBody.Instructions.Count}).");
+                    }
                     var artifact = lowerer.RecompileDetailed(ctx, method);
+                    if (logProgress)
+                    {
+                        ctx.Options.Logger.Info(
+                            $"[semantic-cil] method {methodIndex}/{ctx.VirtualizedMethods.Count} recompiled: cil={artifact?.Body?.Instructions?.Count ?? 0}.");
+                    }
                     var analysis = CilBodyStackAnalyzer.Analyze(ctx, method, artifact);
+                    if (logProgress)
+                    {
+                        ctx.Options.Logger.Info(
+                            $"[semantic-cil] method {methodIndex}/{ctx.VirtualizedMethods.Count} analyzed: issues={analysis.TotalIssues}.");
+                    }
                     result.TotalViolations += analysis.TotalIssues;
                     foreach (var pair in analysis.IssuesByVmByte)
                     {
@@ -3129,6 +4088,7 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Not:
                 case VMOpCode.Neg:
                 case VMOpCode.Add:
+                case VMOpCode.Ceq:
                 case VMOpCode.Sub:
                 case VMOpCode.Xor:
                 case VMOpCode.Shl:
@@ -3180,18 +4140,36 @@ namespace Krypton.Pipeline.Stages
             pop = 0;
             push = 0;
 
+            if (VMOpCodeCatalog.TryGet(opCode, out var semantic) &&
+                semantic.HasFixedStackEffect)
+            {
+                pop = semantic.Pop;
+                push = semantic.Push;
+                return true;
+            }
+
             switch (opCode)
             {
                 case VMOpCode.Nop:
                     return true;
                 case VMOpCode.Ldarg:
                 case VMOpCode.Ldloc:
+                case VMOpCode.Ldloca:
                 case VMOpCode.Ldc_I4:
+                case VMOpCode.Ldc_R4:
+                case VMOpCode.Ldc_R8:
                 case VMOpCode.Ldstr:
                 case VMOpCode.Ldnull:
                 case VMOpCode.Ldsfld:
+                case VMOpCode.Ldsflda:
                 case VMOpCode.Ldtoken:
                     push = 1;
+                    return true;
+                case VMOpCode.Box:
+                    pop = 1;
+                    push = 1;
+                    return true;
+                case VMOpCode.Constrained:
                     return true;
                 case VMOpCode.Newobj:
                 {
@@ -3216,9 +4194,12 @@ namespace Krypton.Pipeline.Stages
                     return true;
                 }
                 case VMOpCode.Ldfld:
+                case VMOpCode.Ldflda:
                 case VMOpCode.Ldlen:
                 case VMOpCode.Ldobj:
                 case VMOpCode.Unbox_Any:
+                case VMOpCode.Isinst:
+                case VMOpCode.Castclass:
                     pop = 1;
                     push = 1;
                     return true;
@@ -3265,6 +4246,11 @@ namespace Krypton.Pipeline.Stages
                     pop = 1;
                     return true;
                 case VMOpCode.BrLessThan:
+                case VMOpCode.BrGreaterThan:
+                case VMOpCode.BrLessOrEqual:
+                case VMOpCode.BrGreaterOrEqual:
+                case VMOpCode.BrEqual:
+                case VMOpCode.BrNotEqual:
                     pop = 2;
                     return true;
                 case VMOpCode.Switch:

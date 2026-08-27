@@ -120,6 +120,12 @@ namespace Krypton.Pipeline.Stages
                     case CilCode.Brfalse:
                     case CilCode.Blt_Un:
                     case CilCode.Bge_Un:
+                    case CilCode.Blt:
+                    case CilCode.Bgt:
+                    case CilCode.Ble:
+                    case CilCode.Bge:
+                    case CilCode.Beq:
+                    case CilCode.Bne_Un:
                         WriteTargetStack(
                             instruction.Operand,
                             stack,
@@ -379,6 +385,7 @@ namespace Krypton.Pipeline.Stages
             switch (instruction.OpCode.Code)
             {
                 case CilCode.Nop:
+                case CilCode.Constrained:
                     return true;
 
                 case CilCode.Ldarg:
@@ -387,6 +394,7 @@ namespace Krypton.Pipeline.Stages
                 case CilCode.Ldarg_2:
                 case CilCode.Ldarg_3:
                 case CilCode.Ldloc:
+                case CilCode.Ldloca:
                 case CilCode.Ldloc_0:
                 case CilCode.Ldloc_1:
                 case CilCode.Ldloc_2:
@@ -409,6 +417,13 @@ namespace Krypton.Pipeline.Stages
                 case CilCode.Ldnull:
                 case CilCode.Ldtoken:
                 case CilCode.Ldsfld:
+                case CilCode.Ldsflda:
+                case CilCode.Ldftn:
+                    push = 1;
+                    return true;
+
+                case CilCode.Ldvirtftn:
+                    pop = 1;
                     push = 1;
                     return true;
 
@@ -443,10 +458,17 @@ namespace Krypton.Pipeline.Stages
 
                 case CilCode.Blt_Un:
                 case CilCode.Bge_Un:
+                case CilCode.Blt:
+                case CilCode.Bgt:
+                case CilCode.Ble:
+                case CilCode.Bge:
+                case CilCode.Beq:
+                case CilCode.Bne_Un:
                     pop = 2;
                     return true;
 
                 case CilCode.Add:
+                case CilCode.Ceq:
                 case CilCode.Sub:
                 case CilCode.Xor:
                 case CilCode.Shl:
@@ -462,6 +484,10 @@ namespace Krypton.Pipeline.Stages
                 case CilCode.Conv_U1:
                 case CilCode.Ldlen:
                 case CilCode.Unbox_Any:
+                case CilCode.Box:
+                case CilCode.Isinst:
+                case CilCode.Castclass:
+                case CilCode.Ldflda:
                 case CilCode.Ldind_I1:
                 case CilCode.Ldind_U1:
                 case CilCode.Ldind_I2:

@@ -199,6 +199,9 @@ namespace Krypton.Pipeline.Stages
 
         private void ResolveRemainingUnknownBranchesStrict(DevirtualizationCtx ctx)
         {
+            if (IsSoundModeEnabled())
+                return;
+
             if (!IsStrictMappingMode())
                 return;
             if (ctx?.Parser?.Reader == null || ctx.Parser.MethodKeys == null || ctx.Parser.Operands == null || ctx.PatternMatcher == null)

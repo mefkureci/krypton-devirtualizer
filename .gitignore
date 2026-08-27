@@ -27,3 +27,12 @@ packages/
 *-Devirtualized.*
 *-Devirtualized-report.txt
 *.tmp-rewrite.*
+
+# Local sample/investigation workspace (target binaries, captured traces,
+# per-sample evidence). Never committed: contains third-party executables
+# and file paths from the local machine.
+/work/
+
+# Python tooling caches
+__pycache__/
+*.pyc
