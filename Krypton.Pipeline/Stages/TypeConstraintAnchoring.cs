@@ -851,6 +851,10 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Shl:
                 case VMOpCode.Shr:
                 case VMOpCode.Ceq:
+                case VMOpCode.Cgt:
+                case VMOpCode.Cgt_Un:
+                case VMOpCode.Clt:
+                case VMOpCode.Clt_Un:
                 case VMOpCode.Ldelem_Ref:
                 case VMOpCode.Ldelem_U1:
                     pop = 2;
@@ -1123,6 +1127,10 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Conv_Ovf_U4:
                 case VMOpCode.Conv_Ovf_U4_Un:
                 case VMOpCode.Ceq:
+                case VMOpCode.Cgt:
+                case VMOpCode.Cgt_Un:
+                case VMOpCode.Clt:
+                case VMOpCode.Clt_Un:
                 case VMOpCode.Sizeof:
                 case VMOpCode.Ldelem_I1:
                 case VMOpCode.Ldelem_I2:

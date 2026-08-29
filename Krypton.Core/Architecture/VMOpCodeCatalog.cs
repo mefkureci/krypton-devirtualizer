@@ -211,6 +211,10 @@ namespace Krypton.Core.Architecture
             A(VMOpCode.Neg, CilOpCodes.Neg, n, 1, 1);
             A(VMOpCode.Not, CilOpCodes.Not, n, 1, 1);
             A(VMOpCode.Ceq, CilOpCodes.Ceq, n, 2, 1);
+            A(VMOpCode.Cgt, CilOpCodes.Cgt, n, 2, 1);
+            A(VMOpCode.Cgt_Un, CilOpCodes.Cgt_Un, n, 2, 1);
+            A(VMOpCode.Clt, CilOpCodes.Clt, n, 2, 1);
+            A(VMOpCode.Clt_Un, CilOpCodes.Clt_Un, n, 2, 1);
 
             C(VMOpCode.Conv_I1, CilOpCodes.Conv_I1);
             C(VMOpCode.Conv_I2, CilOpCodes.Conv_I2);

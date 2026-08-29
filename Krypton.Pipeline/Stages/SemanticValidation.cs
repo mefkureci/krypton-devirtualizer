@@ -3204,6 +3204,10 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Nop:
                 case VMOpCode.Add:
                 case VMOpCode.Ceq:
+                case VMOpCode.Cgt:
+                case VMOpCode.Cgt_Un:
+                case VMOpCode.Clt:
+                case VMOpCode.Clt_Un:
                 case VMOpCode.Sub:
                 case VMOpCode.Xor:
                 case VMOpCode.Shl:
@@ -4089,6 +4093,10 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Neg:
                 case VMOpCode.Add:
                 case VMOpCode.Ceq:
+                case VMOpCode.Cgt:
+                case VMOpCode.Cgt_Un:
+                case VMOpCode.Clt:
+                case VMOpCode.Clt_Un:
                 case VMOpCode.Sub:
                 case VMOpCode.Xor:
                 case VMOpCode.Shl:

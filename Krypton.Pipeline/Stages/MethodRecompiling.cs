@@ -652,6 +652,10 @@ namespace Krypton.Pipeline.Stages
                     return true;
                 case VMOpCode.Add:
                 case VMOpCode.Ceq:
+                case VMOpCode.Cgt:
+                case VMOpCode.Cgt_Un:
+                case VMOpCode.Clt:
+                case VMOpCode.Clt_Un:
                 case VMOpCode.Sub:
                 case VMOpCode.Xor:
                 case VMOpCode.Shl:
@@ -1072,6 +1076,14 @@ namespace Krypton.Pipeline.Stages
                     return new CilInstruction(CilOpCodes.Add);
                 case VMOpCode.Ceq:
                     return new CilInstruction(CilOpCodes.Ceq);
+                case VMOpCode.Cgt:
+                    return new CilInstruction(CilOpCodes.Cgt);
+                case VMOpCode.Cgt_Un:
+                    return new CilInstruction(CilOpCodes.Cgt_Un);
+                case VMOpCode.Clt:
+                    return new CilInstruction(CilOpCodes.Clt);
+                case VMOpCode.Clt_Un:
+                    return new CilInstruction(CilOpCodes.Clt_Un);
                 case VMOpCode.Xor:
                     return new CilInstruction(CilOpCodes.Xor);
                 case VMOpCode.Shl:

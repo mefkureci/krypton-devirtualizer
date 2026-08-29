@@ -162,6 +162,14 @@ namespace Krypton.Core.Architecture
         Refanytype,
 
         // The VM record format has a dedicated Int64 operand form.
-        Ldc_I8
+        Ldc_I8,
+
+        // A comparison pushed as a value (e.g. `bool b = x > y;`) is behaviourally
+        // distinct from the same comparison used as a branch condition — leaving
+        // these out silently forced such handler bytes onto a wrong opcode.
+        Cgt,
+        Cgt_Un,
+        Clt,
+        Clt_Un
     }
 }

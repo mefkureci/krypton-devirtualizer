@@ -29,7 +29,7 @@ namespace Krypton.Pipeline.Stages
         private static readonly VMOpCode[] BinaryCandidates =
         {
             VMOpCode.Add, VMOpCode.Sub, VMOpCode.Xor, VMOpCode.Shl, VMOpCode.Shr,
-            VMOpCode.Ceq
+            VMOpCode.Ceq, VMOpCode.Cgt, VMOpCode.Cgt_Un, VMOpCode.Clt, VMOpCode.Clt_Un
         };
 
         public static IList<KnownPlaintextAnchor> Solve(
@@ -380,6 +380,10 @@ namespace Krypton.Pipeline.Stages
                 VMOpCode.Shl => left << (right & 31),
                 VMOpCode.Shr => left >> (right & 31),
                 VMOpCode.Ceq => left == right ? 1 : 0,
+                VMOpCode.Cgt => left > right ? 1 : 0,
+                VMOpCode.Cgt_Un => (uint)left > (uint)right ? 1 : 0,
+                VMOpCode.Clt => left < right ? 1 : 0,
+                VMOpCode.Clt_Un => (uint)left < (uint)right ? 1 : 0,
                 _ => throw new ArgumentOutOfRangeException(nameof(op))
             };
         }

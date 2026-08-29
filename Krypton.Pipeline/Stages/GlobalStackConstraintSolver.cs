@@ -678,6 +678,10 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Shl:
                 case VMOpCode.Shr:
                 case VMOpCode.Ceq:
+                case VMOpCode.Cgt:
+                case VMOpCode.Cgt_Un:
+                case VMOpCode.Clt:
+                case VMOpCode.Clt_Un:
                 case VMOpCode.Ldelem_Ref:
                 case VMOpCode.Ldelem_U1:
                 case VMOpCode.Ldelema:
