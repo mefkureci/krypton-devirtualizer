@@ -364,6 +364,10 @@ namespace Krypton.Pipeline.Stages
                 // Parse parameters from MemberSig for proper arity
                 var paramTypes = ParseParamTypes(memberSig, instr);
 
+                var isGenericMethod = instr.TryGetProperty("IsGenericMethod", out var isGenMethodProp) &&
+                                       isGenMethodProp.ValueKind == JsonValueKind.True;
+                var methodGenericArgs = ReadStringList(instr, "MethodGenericArgs");
+
                 return new CalleeDescriptor
                 {
                     Opcode        = opcode,
@@ -373,6 +377,8 @@ namespace Krypton.Pipeline.Stages
                     DeclaringAssembly = declAssembly,
                     ParamTypes    = paramTypes,
                     IsInstance    = memberSig.StartsWith("instance", StringComparison.Ordinal),
+                    IsGenericMethod   = isGenericMethod,
+                    MethodGenericArgs = methodGenericArgs,
                 };
             }
             return null;
@@ -394,6 +400,19 @@ namespace Krypton.Pipeline.Stages
                     result.Add(r ? t + "&" : t);
                 }
             }
+            return result;
+        }
+
+        private static List<string> ReadStringList(JsonElement instr, string propertyName)
+        {
+            var result = new List<string>();
+            if (!instr.TryGetProperty(propertyName, out var arr) || arr.ValueKind != JsonValueKind.Array)
+                return result;
+
+            foreach (var item in arr.EnumerateArray())
+                if (item.ValueKind == JsonValueKind.String)
+                    result.Add(item.GetString());
+
             return result;
         }
 
@@ -651,7 +670,30 @@ namespace Krypton.Pipeline.Stages
                 if (string.Equals(callee.MethodName, ".ctor", StringComparison.Ordinal))
                     opcode = CilOpCodes.Newobj;
 
-                return new CilInstruction(opcode, memberRef);
+                IMethodDescriptor target = memberRef;
+                if (callee.IsGenericMethod)
+                {
+                    // Flagged as a generic method instantiation but the runtime dump captured
+                    // no concrete arguments — reconstructing would mean guessing the
+                    // instantiation. Skip this call site rather than emit a wrong one.
+                    if (callee.MethodGenericArgs == null || callee.MethodGenericArgs.Count == 0)
+                        return null;
+
+                    var corLib = module.CorLibTypeFactory;
+                    var genericArgs = new TypeSignature[callee.MethodGenericArgs.Count];
+                    for (var idx = 0; idx < callee.MethodGenericArgs.Count; idx++)
+                    {
+                        var argSig = ParseTypeSig(callee.MethodGenericArgs[idx], module, corLib);
+                        if (argSig == null)
+                            return null; // couldn't resolve one of the generic arguments — skip, don't guess
+
+                        genericArgs[idx] = argSig;
+                    }
+
+                    target = new MethodSpecification(memberRef, new GenericInstanceMethodSignature(genericArgs));
+                }
+
+                return new CilInstruction(opcode, target);
             }
             catch (Exception ex)
             {
@@ -1115,5 +1157,7 @@ namespace Krypton.Pipeline.Stages
         public string       DeclaringAssembly { get; set; }
         public List<string> ParamTypes    { get; set; } = new List<string>();
         public bool         IsInstance    { get; set; }
+        public bool         IsGenericMethod    { get; set; }
+        public List<string> MethodGenericArgs  { get; set; } = new List<string>();
     }
 }

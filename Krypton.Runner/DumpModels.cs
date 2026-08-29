@@ -82,6 +82,13 @@ namespace Krypton.Runner
         // for call/callvirt/newobj: are any params by-ref?
         public List<ParamEntry> Params { get; set; }
 
+        // Generic method instantiation (e.g. `Foo&lt;int&gt;(...)`), captured only when the
+        // resolved operand is a closed generic method (dnlib MethodSpec). Each entry is a
+        // fully-qualified, concrete (closed) type name — there is no open-generic ambiguity
+        // to resolve, since this comes from the live DynamicMethod's actual target.
+        public bool IsGenericMethod { get; set; }
+        public List<string> MethodGenericArgs { get; set; }
+
         // branch / switch
         public int? BranchTarget { get; set; }
         public List<int> SwitchTargets { get; set; }

@@ -201,6 +201,14 @@ namespace Krypton.Runner
             e.DeclAssembly = AssemblyNameOf(m.DeclaringType);
             e.MemberName  = m.Name;
 
+            if (m is MethodSpec spec && spec.GenericInstMethodSig != null)
+            {
+                e.IsGenericMethod = true;
+                e.MethodGenericArgs = new List<string>();
+                foreach (var arg in spec.GenericInstMethodSig.GenericArguments)
+                    e.MethodGenericArgs.Add(arg?.FullName ?? "System.Object");
+            }
+
             var ms = m.MethodSig;
             if (ms == null) return;
 
