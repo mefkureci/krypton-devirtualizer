@@ -3009,82 +3009,42 @@ namespace Krypton.Pipeline.Stages
 
         private static void FixDnSpyStackIssues(DevirtualizationCtx ctx, ModuleDefinition module, CleanOptions options)
         {
-            var targetToken = 0x0600005B;
-            var rawToken = Environment.GetEnvironmentVariable("KRYPTON_CLEAN_DNSPY_TOKEN");
-            if (!string.IsNullOrWhiteSpace(rawToken))
-            {
-                try
-                {
-                    targetToken = rawToken.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
-                        ? Convert.ToInt32(rawToken, 16)
-                        : Convert.ToInt32(rawToken, 10);
-                }
-                catch
-                {
-                    // keep default
-                }
-            }
+            // ApplyBasicDnSpyCleanup (unreachable-block NOP'ing, dup/pop and const-push/pop
+            // stack-noise removal) is a sample-independent, idempotent structural cleanup - it
+            // used to be gated behind finding one hand-picked method (by hardcoded token, or by
+            // an equally hardcoded obfuscated name as fallback) from a single sample. Apply it
+            // to every method with a body in the configured namespace instead, so it actually
+            // helps on any sample rather than only the one it was hand-tuned against.
+            var cleanedMethods = 0;
+            var totalTouched = 0;
 
-            var targetName = Environment.GetEnvironmentVariable("KRYPTON_CLEAN_DNSPY_NAME") ?? "ÂÂ•";
-            MethodDefinition target = null;
             foreach (var type in module.GetAllTypes())
             {
+                if (!IsInNamespace(type, options.CleanNamespace))
+                    continue;
+
                 foreach (var method in type.Methods)
                 {
                     if (!method.HasMethodBody || method.CilMethodBody == null)
                         continue;
-                    try
-                    {
-                        if (method.MetadataToken.ToInt32() == targetToken)
-                        {
-                            target = method;
-                            break;
-                        }
-                    }
-                    catch
-                    {
-                        // ignore
-                    }
-                }
-                if (target != null)
-                    break;
-            }
 
-            if (target == null)
-            {
-                foreach (var type in module.GetAllTypes())
-                {
-                    foreach (var method in type.Methods)
-                    {
-                        if (!method.HasMethodBody || method.CilMethodBody == null)
-                            continue;
-                        if (!string.Equals(method.Name, targetName, StringComparison.Ordinal))
-                            continue;
-                        if (method.Signature == null || method.Signature.ParameterTypes.Count != 2)
-                            continue;
-                        target = method;
-                        break;
-                    }
-                    if (target != null)
-                        break;
+                    var body = method.CilMethodBody;
+                    if (body.Instructions.Count == 0)
+                        continue;
+
+                    var touched = ApplyBasicDnSpyCleanup(body);
+                    if (touched <= 0)
+                        continue;
+
+                    cleanedMethods++;
+                    totalTouched += touched;
                 }
             }
 
-            if (target == null || target.CilMethodBody == null)
-            {
-                ctx.Options.Logger.Info("Post-deobf dnSpy cleanup target not found.");
-                return;
-            }
-
-            if (!IsInNamespace(target.DeclaringType, options.CleanNamespace))
-                return;
-
-            var body = target.CilMethodBody;
-            if (body.Instructions.Count == 0)
-                return;
-            var touched = ApplyBasicDnSpyCleanup(body);
-            if (touched > 0)
-                ctx.Options.Logger.Info($"Post-deobf applied dnSpy stack cleanup to 0x0600005B ({touched} change(s)).");
+            if (cleanedMethods > 0)
+                ctx.Options.Logger.Info($"Post-deobf applied dnSpy stack cleanup to {cleanedMethods} method(s) ({totalTouched} change(s)).");
+            else
+                ctx.Options.Logger.Info("Post-deobf dnSpy cleanup found no methods needing stack noise removal.");
         }
 
         private static int ApplyBasicDnSpyCleanup(CilMethodBody body)

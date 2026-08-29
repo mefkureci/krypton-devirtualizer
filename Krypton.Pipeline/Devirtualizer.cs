@@ -2744,7 +2744,11 @@ namespace Krypton.Pipeline
                 }
             }
 
-            return 0x0600005C;
+            // No candidate matched the int->string signature scan. Returning a token from a
+            // different sample here would silently corrupt output on this one — every caller
+            // already treats "no instruction has this token" (0 never matches a real token) as
+            // "no decoder found, decode nothing" and degrades gracefully.
+            return 0;
         }
 
         private Dictionary<uint, int> ResolveRuntimeFieldValues(
