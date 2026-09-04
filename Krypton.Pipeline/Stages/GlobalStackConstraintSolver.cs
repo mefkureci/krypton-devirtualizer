@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -319,6 +319,8 @@ namespace Krypton.Pipeline.Stages
                 state.Nodes++;
                 if (!IsStackConsistent(ctx, method, assignment, complete: true, out _, out _))
                     return;
+                if (!TypedStackConstraint.IsTypeConsistent(ctx, method, assignment, out _, out _))
+                    return;
 
                 state.Feasible++;
                 foreach (var pair in assignment)
@@ -334,10 +336,18 @@ namespace Krypton.Pipeline.Stages
 
                 state.Nodes++;
                 assignment[vmByte] = candidate;
-                if (IsStackConsistent(ctx, method, assignment, complete: false, out _, out _))
+
+                // Depth and metadata types are independent facts about the same
+                // assignment; a candidate has to survive both to stay in the tree.
+                if (IsStackConsistent(ctx, method, assignment, complete: false, out _, out _) &&
+                    TypedStackConstraint.IsTypeConsistent(ctx, method, assignment, out _, out _))
+                {
                     Search(ctx, method, order, index + 1, local, assignment, possible, state);
+                }
                 else
+                {
                     state.Pruned++;
+                }
                 assignment.Remove(vmByte);
             }
         }
@@ -585,7 +595,7 @@ namespace Krypton.Pipeline.Stages
                 : 1;
         }
 
-        private enum FlowKind
+        internal enum FlowKind
         {
             Fall,
             Unconditional,
@@ -597,7 +607,7 @@ namespace Krypton.Pipeline.Stages
             Throw
         }
 
-        private static bool TryGetEffect(
+        internal static bool TryGetEffect(
             DevirtualizationCtx ctx,
             VMOpCode opcode,
             object operand,

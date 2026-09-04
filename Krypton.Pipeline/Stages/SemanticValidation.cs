@@ -13,7 +13,7 @@ using Krypton.Core.Architecture;
 
 namespace Krypton.Pipeline.Stages
 {
-    public sealed class SemanticValidation : IStage, IVmSemanticValidator
+    public sealed partial class SemanticValidation : IStage, IVmSemanticValidator
     {
         public string Name => nameof(SemanticValidation);
 
@@ -285,6 +285,15 @@ namespace Krypton.Pipeline.Stages
                 var baselineCil = verifiableIlMode
                     ? EvaluateCilMethods(ctx, lowerer, cilEvaluationCache)
                     : null;
+                var totalVmInstructions = CountTotalVmInstructions(ctx);
+                var baselineCilScore = verifiableIlMode
+                    ? ScoreState(ctx, baselineCil.TotalViolations, totalVmInstructions)
+                    : 0;
+
+                // The VM violation walk stops at unreachable code just like the recompiler
+                // does, so a byte remapped to a terminal opcode scores well by hiding the
+                // rest of the method. Score reachability alongside violations here too.
+                var baselineVmScore = ScoreState(ctx, baseline.TotalViolations, totalVmInstructions);
 
                 var candidates = CollectCandidateVmBytes(ctx, profile, baseline);
                 SemanticCandidateAdjustment bestAdjustment = null;
@@ -311,11 +320,10 @@ namespace Krypton.Pipeline.Stages
                         if (!AreCandidateOperandsSemanticallyCompatible(ctx, vmByte, candidate))
                             continue;
 
-                        var eval = EvaluateMethods(
-                            ctx,
-                            profile,
-                            new Dictionary<int, VMOpCode> { { vmByte, candidate } });
-                        var improvement = baseline.TotalViolations - eval.TotalViolations;
+                        var substitution = new Dictionary<int, VMOpCode> { { vmByte, candidate } };
+                        var eval = EvaluateMethods(ctx, profile, substitution);
+                        var evalScore = ScoreState(ctx, eval.TotalViolations, totalVmInstructions, substitution);
+                        var improvement = baselineVmScore - evalScore;
                         var minimumImprovement = suspicious ? 1 : profile.MinimumViolationImprovement;
                         if (improvement < minimumImprovement)
                             continue;
@@ -329,10 +337,10 @@ namespace Krypton.Pipeline.Stages
                                 new Dictionary<int, VMOpCode?> { { vmByte, candidate } },
                                 logChanges: false);
                             var candidateCil = EvaluateCilMethods(ctx, lowerer, cilEvaluationCache);
+                            candidateCilViolations = ScoreState(ctx, candidateCil.TotalViolations, totalVmInstructions);
                             RestoreMappingState(ctx, snapshot);
 
-                            candidateCilViolations = candidateCil.TotalViolations;
-                            candidateCilImprovement = (baselineCil?.TotalViolations ?? 0) - candidateCilViolations;
+                            candidateCilImprovement = baselineCilScore - candidateCilViolations;
                             if (candidateCilImprovement <= 0)
                                 continue;
                         }
@@ -407,6 +415,8 @@ namespace Krypton.Pipeline.Stages
 
                 var baselineVm = EvaluateMethods(ctx, profile, null);
                 var baselineEntryUnderflows = CountReachableEntryUnderflowMethods(ctx);
+                var totalVmInstructions = CountTotalVmInstructions(ctx);
+                var baselineScore = ScoreState(ctx, baselineCil.TotalViolations, totalVmInstructions);
                 var knownFrequency = BuildKnownFrequency(ctx);
                 SemanticCandidateAdjustment bestAdjustment = null;
                 var bestVmViolations = int.MaxValue;
@@ -440,9 +450,10 @@ namespace Krypton.Pipeline.Stages
                         ApplyChanges(ctx, new Dictionary<int, VMOpCode?> { { vmByte, candidate } }, logChanges: false);
                         var candidateCil = EvaluateCilMethods(ctx, lowerer, cilEvaluationCache);
                         var candidateVm = EvaluateMethods(ctx, profile, null);
+                        var candidateScore = ScoreState(ctx, candidateCil.TotalViolations, totalVmInstructions);
                         RestoreMappingState(ctx, snapshot);
 
-                        var improvement = baselineCil.TotalViolations - candidateCil.TotalViolations;
+                        var improvement = baselineScore - candidateScore;
                         if (improvement <= 0)
                             continue;
 
@@ -460,16 +471,16 @@ namespace Krypton.Pipeline.Stages
                         if (bestAdjustment == null ||
                             candidateEntryUnderflows < bestEntryUnderflows ||
                             (candidateEntryUnderflows == bestEntryUnderflows &&
-                             (candidateCil.TotalViolations < bestAdjustment.CandidateViolations ||
-                              (candidateCil.TotalViolations == bestAdjustment.CandidateViolations &&
+                             (candidateScore < bestAdjustment.CandidateViolations ||
+                              (candidateScore == bestAdjustment.CandidateViolations &&
                                candidateVm.TotalViolations < bestVmViolations))))
                         {
                             bestAdjustment = new SemanticCandidateAdjustment(
                                 vmByte,
                                 current,
                                 candidate,
-                                baselineCil.TotalViolations,
-                                candidateCil.TotalViolations,
+                                baselineScore,
+                                candidateScore,
                                 pair.Value);
                             bestVmViolations = candidateVm.TotalViolations;
                             bestEntryUnderflows = candidateEntryUnderflows;
@@ -502,6 +513,10 @@ namespace Krypton.Pipeline.Stages
 
                 var baselineCil = EvaluateCilMethods(ctx, lowerer, cilEvaluationCache);
                 var baselineVm = EvaluateMethods(ctx, profile, null);
+                var totalVmInstructions = CountTotalVmInstructions(ctx);
+                // Truncating a method also removes its entry underflow, so this loop needs
+                // the same reachability accounting as the ones above.
+                var baselineCilScore = ScoreState(ctx, baselineCil.TotalViolations, totalVmInstructions);
                 var knownFrequency = BuildKnownFrequency(ctx);
                 var candidateVmBytes = CollectEntryUnderflowCandidateVmBytes(ctx, baselineCil, knownFrequency);
                 if (candidateVmBytes.Count == 0)
@@ -546,11 +561,12 @@ namespace Krypton.Pipeline.Stages
                         var candidateEntryUnderflows = CountReachableEntryUnderflowMethods(ctx);
                         var candidateCil = EvaluateCilMethods(ctx, lowerer, cilEvaluationCache);
                         var candidateVm = EvaluateMethods(ctx, profile, null);
+                        var candidateCilScore = ScoreState(ctx, candidateCil.TotalViolations, totalVmInstructions);
                         RestoreMappingState(ctx, snapshot);
 
                         if (candidateEntryUnderflows >= baselineEntryUnderflows)
                             continue;
-                        if (candidateCil.TotalViolations > baselineCil.TotalViolations + allowedCilRegression)
+                        if (candidateCilScore > baselineCilScore + allowedCilRegression)
                             continue;
                         if (candidateVm.TotalViolations > baselineVm.TotalViolations + allowedVmRegression)
                             continue;

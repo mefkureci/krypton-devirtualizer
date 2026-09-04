@@ -557,7 +557,7 @@ namespace Krypton.Pipeline.Stages
             return StackTypeKind.Unknown;
         }
 
-        private static StackTypeKind ClassifyDescriptor(ITypeDescriptor descriptor)
+        internal static StackTypeKind ClassifyDescriptor(ITypeDescriptor descriptor)
         {
             if (descriptor == null)
                 return StackTypeKind.Unknown;
@@ -780,7 +780,7 @@ namespace Krypton.Pipeline.Stages
             }
         }
 
-        private static bool IsValueTypeDeclaring(IMethodDescriptor descriptor)
+        internal static bool IsValueTypeDeclaring(IMethodDescriptor descriptor)
         {
             try
             {
@@ -1029,7 +1029,7 @@ namespace Krypton.Pipeline.Stages
             return targets;
         }
 
-        private static StackTypeKind Classify(TypeSignature signature)
+        internal static StackTypeKind Classify(TypeSignature signature)
         {
             if (signature == null)
                 return StackTypeKind.Unknown;
@@ -1348,7 +1348,7 @@ namespace Krypton.Pipeline.Stages
             return true;
         }
 
-        private static object Lookup(DevirtualizationCtx ctx, int token)
+        internal static object Lookup(DevirtualizationCtx ctx, int token)
         {
             try
             {

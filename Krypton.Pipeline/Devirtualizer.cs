@@ -436,6 +436,48 @@ namespace Krypton.Pipeline
                     }
                 }
 
+                var enableNewobjStaleStaticReadRepair = GetFeatureToggle(
+                    "KRYPTON_ENABLE_NEWOBJ_STALE_STATIC_READ_REPAIR",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_NEWOBJ_STALE_STATIC_READ_REPAIR");
+                if (enableNewobjStaleStaticReadRepair)
+                {
+                    var repairedNewobjStaleReads = RepairNewobjFollowedByStaleStaticFieldRead(Ctx.Module);
+                    if (repairedNewobjStaleReads > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Repaired {repairedNewobjStaleReads} newobj+stale-ldsfld sequence(s) (flipped to stsfld).");
+                    }
+                }
+
+                var enableMissingPopRepair = GetFeatureToggle(
+                    "KRYPTON_ENABLE_MISSING_POP_REPAIR",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_MISSING_POP_REPAIR");
+                if (enableMissingPopRepair)
+                {
+                    var repairedMissingPops = RepairMissingPopBeforeVoidReturn(Ctx.Module);
+                    if (repairedMissingPops > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Repaired {repairedMissingPops} missing-pop-before-void-return site(s).");
+                    }
+                }
+
+                var enableArithmeticJunkRepair = GetFeatureToggle(
+                    "KRYPTON_ENABLE_ARITHMETIC_JUNK_FIELD_REPAIR",
+                    defaultEnabled: true,
+                    disableVariableName: "KRYPTON_DISABLE_ARITHMETIC_JUNK_FIELD_REPAIR");
+                if (enableArithmeticJunkRepair)
+                {
+                    var repairedArithmeticJunk = RepairArithmeticJunkBeforeFieldAccess(Ctx.Module);
+                    if (repairedArithmeticJunk > 0)
+                    {
+                        Ctx.Options.Logger.Warning(
+                            $"Repaired {repairedArithmeticJunk} arithmetic-junk-before-ldfld sequence(s) (removed dead computation burying the reference).");
+                    }
+                }
+
                 var enableReactorRuntimeCleanup = GetFeatureToggle(
                     "KRYPTON_ENABLE_REACTOR_RUNTIME_CLEANUP",
                     defaultEnabled: true,
@@ -3244,55 +3286,14 @@ namespace Krypton.Pipeline
             string logPrefix,
             string[] extraArgs = null)
         {
-            var runnerPath = FindRunnerExecutable();
-            if (runnerPath == null)
-            {
-                Ctx?.Options?.Logger?.Warning($"[{logPrefix}] Krypton.Runner.exe not found.");
-                return false;
-            }
-
-            try
-            {
-                var args = new List<string>
-                {
-                    mode,
-                    targetPath,
-                    outputPath
-                };
-                if (extraArgs != null)
-                    args.AddRange(extraArgs);
-
-                var psi = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = runnerPath,
-                    Arguments = string.Join(" ", args.Select(QuoteArgument)),
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                };
-
-                using var proc = System.Diagnostics.Process.Start(psi);
-                if (proc == null)
-                    return false;
-
-                var stdout = proc.StandardOutput.ReadToEnd();
-                var stderr = proc.StandardError.ReadToEnd();
-                proc.WaitForExit(60_000);
-
-                foreach (var line in stdout.Split('\n'))
-                    if (!string.IsNullOrWhiteSpace(line))
-                        Ctx?.Options?.Logger?.Info($"  [{logPrefix}] {line.TrimEnd()}");
-                foreach (var line in stderr.Split('\n'))
-                    if (!string.IsNullOrWhiteSpace(line))
-                        Ctx?.Options?.Logger?.Warning($"  [{logPrefix}/err] {line.TrimEnd()}");
-
-                return proc.ExitCode == 0 && File.Exists(outputPath);
-            }
-            catch (Exception ex)
-            {
-                Ctx?.Options?.Logger?.Warning($"[{logPrefix}] Runner invocation failed: {ex.Message}");
-                return false;
-            }
+            return RunnerInvoker.Invoke(
+                mode,
+                targetPath,
+                outputPath,
+                logPrefix,
+                line => Ctx?.Options?.Logger?.Info(line),
+                line => Ctx?.Options?.Logger?.Warning(line),
+                extraArgs);
         }
 
         private int RestoreNecrobitMethodBodies(AsmResolver.DotNet.ModuleDefinition module)
@@ -3805,19 +3806,7 @@ namespace Krypton.Pipeline
             }
         }
 
-        private static string FindRunnerExecutable()
-        {
-            var baseDir = AppContext.BaseDirectory;
-            var up4 = Path.Combine(baseDir, "..", "..", "..", "..");
-            var candidates = new[]
-            {
-                Path.Combine(baseDir, "Krypton.Runner.exe"),
-                Path.Combine(up4, "Krypton.Runner", "bin", "Release", "net48", "Krypton.Runner.exe"),
-                Path.Combine(up4, "Krypton.Runner", "bin", "Debug", "net48", "Krypton.Runner.exe"),
-            };
-
-            return candidates.Select(Path.GetFullPath).FirstOrDefault(File.Exists);
-        }
+        private static string FindRunnerExecutable() => RunnerInvoker.FindExecutable();
 
         private static string QuoteArgument(string value)
         {
@@ -4964,6 +4953,301 @@ namespace Krypton.Pipeline
             public uint Token { get; set; }
             public int? Int32 { get; set; }
             public float? Single { get; set; }
+        }
+
+        private static readonly HashSet<CilCode> PureIntBinaryOps = new HashSet<CilCode>
+        {
+            CilCode.Add, CilCode.Add_Ovf, CilCode.Add_Ovf_Un,
+            CilCode.Sub, CilCode.Sub_Ovf, CilCode.Sub_Ovf_Un,
+            CilCode.Mul, CilCode.Mul_Ovf, CilCode.Mul_Ovf_Un,
+            CilCode.Div, CilCode.Div_Un,
+            CilCode.Rem, CilCode.Rem_Un,
+            CilCode.And, CilCode.Or, CilCode.Xor,
+            CilCode.Shl, CilCode.Shr, CilCode.Shr_Un
+        };
+
+        private static readonly HashSet<CilCode> PureIntUnaryOps = new HashSet<CilCode>
+        {
+            CilCode.Neg, CilCode.Not,
+            CilCode.Conv_I, CilCode.Conv_I1, CilCode.Conv_I2, CilCode.Conv_I4, CilCode.Conv_I8,
+            CilCode.Conv_U, CilCode.Conv_U1, CilCode.Conv_U2, CilCode.Conv_U4, CilCode.Conv_U8,
+            CilCode.Conv_Ovf_I4, CilCode.Conv_Ovf_U4, CilCode.Conv_Ovf_I4_Un, CilCode.Conv_Ovf_U4_Un
+        };
+
+        private bool IsPureIntInstruction(CilInstruction instruction) =>
+            IsLdcI4(instruction) ||
+            PureIntBinaryOps.Contains(instruction.OpCode.Code) ||
+            PureIntUnaryOps.Contains(instruction.OpCode.Code);
+
+        // Ldfld/Ldflda always need a reference on top of the stack, never an int - so if a
+        // self-contained run of nothing but int32 constants and pure arithmetic (Ldc_I4/Shl/
+        // Xor/etc, reading only values it pushed itself) sits directly in front of one of
+        // these, its net result cannot legitimately be the thing being dereferenced. In every
+        // occurrence seen so far it is VM junk-constant arithmetic (an opaque, side-effect-free
+        // computation) that got left on the stack on top of the real reference instead of being
+        // discarded, burying that reference and producing a verifier StackUnexpected /
+        // ExpectedIntegerType error (and an InvalidProgramException at runtime). Since the
+        // whole run is provably side-effect-free, deleting it is equivalent to computing it and
+        // immediately popping the result, and it exposes the real reference underneath to the
+        // consumer that actually needs it.
+        // A void method must have an empty stack at `ret`. If the instruction right before
+        // `ret` is a Call/Callvirt/Newobj whose pushed value type is not System.Void, that
+        // return value was never consumed - almost always because the source called a method
+        // purely for its side effect (e.g. `MessageBox.Show(...)` as a statement) and the VM's
+        // trailing Pop either got dropped or was misclassified as something else. Inserting the
+        // missing Pop is the only fix that doesn't touch the call itself.
+        private int RepairMissingPopBeforeVoidReturn(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return 0;
+
+            var repaired = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    var body = method?.CilMethodBody;
+                    if (body == null)
+                        continue;
+                    if (!string.Equals(method.Signature?.ReturnType?.FullName, "System.Void", StringComparison.Ordinal))
+                        continue;
+
+                    var instructions = body.Instructions;
+                    for (var i = instructions.Count - 1; i >= 1; i--)
+                    {
+                        if (instructions[i].OpCode.Code != CilCode.Ret)
+                            continue;
+
+                        var previous = instructions[i - 1];
+                        string pushedTypeName = null;
+                        switch (previous.OpCode.Code)
+                        {
+                            case CilCode.Call:
+                            case CilCode.Callvirt:
+                                if (previous.Operand is IMethodDescriptor calledMethod)
+                                    pushedTypeName = calledMethod.Signature?.ReturnType?.FullName;
+                                break;
+                            case CilCode.Newobj:
+                                if (previous.Operand is IMethodDescriptor ctor)
+                                    pushedTypeName = ctor.DeclaringType?.FullName;
+                                break;
+                        }
+
+                        if (pushedTypeName == null || string.Equals(pushedTypeName, "System.Void", StringComparison.Ordinal))
+                            continue;
+
+                        instructions.Insert(i, new CilInstruction(CilOpCodes.Pop));
+                        repaired++;
+                    }
+                }
+            }
+
+            return repaired;
+        }
+
+        private int RepairArithmeticJunkBeforeFieldAccess(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return 0;
+
+            var repaired = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    var body = method?.CilMethodBody;
+                    if (body == null)
+                        continue;
+
+                    repaired += RepairArithmeticJunkBeforeFieldAccess(body);
+                }
+            }
+
+            return repaired;
+        }
+
+        private int RepairArithmeticJunkBeforeFieldAccess(CilMethodBody body)
+        {
+            var instructions = body.Instructions;
+            if (instructions.Count == 0)
+                return 0;
+
+            var branchTargets = CollectBranchTargetInstructions(body);
+            var repaired = 0;
+
+            for (var end = 0; end < instructions.Count; end++)
+            {
+                var consumer = instructions[end];
+                if (consumer.OpCode.Code != CilCode.Ldfld && consumer.OpCode.Code != CilCode.Ldflda)
+                    continue;
+
+                var eligibleStart = end;
+                while (eligibleStart > 0 && IsPureIntInstruction(instructions[eligibleStart - 1]))
+                    eligibleStart--;
+
+                if (eligibleStart == end || eligibleStart == 0)
+                    continue; // nothing eligible, or the whole prefix is eligible (no real producer beneath it)
+
+                // Find the maximal self-contained suffix of [eligibleStart, end) that nets
+                // exactly +1 on the stack without ever reaching below its own start.
+                var start = eligibleStart;
+                while (start < end)
+                {
+                    var depth = 0;
+                    var valid = true;
+                    for (var k = start; k < end; k++)
+                    {
+                        var instr = instructions[k];
+                        if (IsLdcI4(instr))
+                        {
+                            depth += 1;
+                        }
+                        else if (PureIntBinaryOps.Contains(instr.OpCode.Code))
+                        {
+                            if (depth < 2) { valid = false; break; }
+                            depth -= 1;
+                        }
+                        else // pure unary op
+                        {
+                            if (depth < 1) { valid = false; break; }
+                        }
+                    }
+
+                    if (!valid)
+                    {
+                        start++;
+                        continue;
+                    }
+
+                    if (depth != 1)
+                        break; // balanced (or leaves more than one value) - not this bug pattern
+
+                    var blocked = false;
+                    for (var k = start; k < end; k++)
+                    {
+                        if (branchTargets.Contains(instructions[k]))
+                        {
+                            blocked = true;
+                            break;
+                        }
+                    }
+
+                    if (blocked)
+                        break;
+
+                    for (var k = end - 1; k >= start; k--)
+                        instructions.RemoveAt(k);
+
+                    repaired++;
+                    end = start; // consumer is now directly after whatever precedes the removed run
+                    break;
+                }
+            }
+
+            return repaired;
+        }
+
+        private HashSet<CilInstruction> CollectBranchTargetInstructions(CilMethodBody body)
+        {
+            var targets = new HashSet<CilInstruction>(ReferenceEqualityComparer.Instance);
+
+            void AddLabel(ICilLabel label)
+            {
+                var target = (label as CilInstructionLabel)?.Instruction;
+                if (target != null)
+                    targets.Add(target);
+            }
+
+            foreach (var instruction in body.Instructions)
+            {
+                if (instruction.Operand is ICilLabel singleLabel)
+                {
+                    AddLabel(singleLabel);
+                }
+                else if (instruction.Operand is IEnumerable<ICilLabel> multipleLabels)
+                {
+                    foreach (var label in multipleLabels)
+                        AddLabel(label);
+                }
+            }
+
+            foreach (var handler in body.ExceptionHandlers)
+            {
+                if (handler.TryStart != null) AddLabel(handler.TryStart);
+                if (handler.TryEnd != null) AddLabel(handler.TryEnd);
+                if (handler.HandlerStart != null) AddLabel(handler.HandlerStart);
+                if (handler.HandlerEnd != null) AddLabel(handler.HandlerEnd);
+                if (handler.FilterStart != null) AddLabel(handler.FilterStart);
+            }
+
+            return targets;
+        }
+
+        // Same family of bug as the other VM-byte-reuse repairs in this file: a single VM byte
+        // that is Ldsfld in the overwhelming majority of its occurrences can still be Stsfld at
+        // one specific site, and no global byte->opcode mapping can represent that. The tell here
+        // is structural rather than statistical: `newobj T; ldsfld <static field of type T>`
+        // constructs a fresh instance and then immediately abandons it under a freshly-read stale
+        // value of the exact same type - no legitimate program does that. The only sensible
+        // reading is a lazy-singleton-style `instance = new T()` where the store got mapped to a
+        // read. Flipping that one Ldsfld to Stsfld both fixes the runtime NullReferenceException
+        // (the field would otherwise stay null forever) and typically restores IL stack balance,
+        // since the dangling constructed reference is consumed instead of left on the stack.
+        private int RepairNewobjFollowedByStaleStaticFieldRead(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            if (module == null)
+                return 0;
+
+            var repaired = 0;
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    var body = method?.CilMethodBody;
+                    if (body == null)
+                        continue;
+
+                    var instructions = body.Instructions;
+                    for (var i = 0; i + 1 < instructions.Count; i++)
+                    {
+                        var newobjInstruction = instructions[i];
+                        if (newobjInstruction.OpCode.Code != CilCode.Newobj ||
+                            !(newobjInstruction.Operand is IMethodDescriptor ctor))
+                            continue;
+
+                        var constructedType = ctor.DeclaringType;
+                        if (constructedType == null)
+                            continue;
+
+                        var next = instructions[i + 1];
+                        if (next.OpCode.Code != CilCode.Ldsfld ||
+                            !(next.Operand is IFieldDescriptor field))
+                            continue;
+
+                        AsmResolver.DotNet.FieldDefinition fieldDefinition;
+                        try
+                        {
+                            fieldDefinition = field.Resolve();
+                        }
+                        catch
+                        {
+                            continue;
+                        }
+
+                        var fieldType = fieldDefinition?.Signature?.FieldType;
+                        if (fieldType == null ||
+                            !string.Equals(fieldType.FullName, constructedType.FullName, StringComparison.Ordinal))
+                        {
+                            continue;
+                        }
+
+                        next.OpCode = CilOpCodes.Stsfld;
+                        repaired++;
+                    }
+                }
+            }
+
+            return repaired;
         }
 
         private int RepairStaticDataInitializers(AsmResolver.DotNet.ModuleDefinition module)
@@ -6481,7 +6765,63 @@ namespace Krypton.Pipeline
             };
 
             var owner = cctor.DeclaringType;
+            decision.OwnStaticStores += CountOwnStaticStores(cctor.CilMethodBody.Instructions, owner);
+
+            // The store doesn't have to happen directly inside the cctor: a bootstrap-looking
+            // cctor that just forwards to one obfuscated worker method is indistinguishable,
+            // by instruction count alone, from a legitimate initializer that does the same -
+            // e.g. `static X() { InitState(); }` where InitState() is the one place that sets
+            // this type's static fields. Checking only the cctor's own instructions for Stsfld
+            // misses that case and neutralizes a body something else still depends on (a false
+            // positive is worse than a false negative here - see the class-level comment above).
+            // So also look one call deep, into methods the cctor directly invokes.
             foreach (var instruction in cctor.CilMethodBody.Instructions)
+            {
+                if (instruction.OpCode.Code != CilCode.Call && instruction.OpCode.Code != CilCode.Callvirt)
+                    continue;
+                if (!(instruction.Operand is IMethodDescriptor callee))
+                    continue;
+
+                AsmResolver.DotNet.MethodDefinition calleeDef;
+                try
+                {
+                    calleeDef = callee.Resolve();
+                }
+                catch
+                {
+                    continue;
+                }
+
+                var calleeBody = calleeDef?.CilMethodBody;
+                if (calleeBody == null)
+                    continue;
+
+                decision.OwnStaticStores += CountOwnStaticStores(calleeBody.Instructions, owner);
+            }
+
+            if (!decision.HugeWorker)
+            {
+                decision.Reason = "no dispatch into a huge worker";
+                return decision;
+            }
+
+            if (decision.OwnStaticStores > 0)
+            {
+                decision.Reason = "initializes its own type's static state";
+                return decision;
+            }
+
+            decision.Neutralize = true;
+            decision.Reason = "dispatches into a huge worker and initializes no state of its own";
+            return decision;
+        }
+
+        private int CountOwnStaticStores(
+            IEnumerable<CilInstruction> instructions,
+            AsmResolver.DotNet.TypeDefinition owner)
+        {
+            var count = 0;
+            foreach (var instruction in instructions)
             {
                 if (instruction.OpCode.Code != CilCode.Stsfld)
                     continue;
@@ -6500,25 +6840,11 @@ namespace Krypton.Pipeline
                 if (definition?.DeclaringType != null &&
                     ReferenceEquals(definition.DeclaringType, owner))
                 {
-                    decision.OwnStaticStores++;
+                    count++;
                 }
             }
 
-            if (!decision.HugeWorker)
-            {
-                decision.Reason = "no dispatch into a huge worker";
-                return decision;
-            }
-
-            if (decision.OwnStaticStores > 0)
-            {
-                decision.Reason = "initializes its own type's static state";
-                return decision;
-            }
-
-            decision.Neutralize = true;
-            decision.Reason = "dispatches into a huge worker and initializes no state of its own";
-            return decision;
+            return count;
         }
 
         private bool LooksLikeBootstrapTypeInitializer(AsmResolver.DotNet.MethodDefinition cctor)

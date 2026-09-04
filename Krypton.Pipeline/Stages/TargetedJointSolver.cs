@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -36,6 +36,22 @@ namespace Krypton.Pipeline.Stages
         private const long MaxNodes = 40_000_000L;
         private const long MaxFeasible = 50_000L;
 
+        // Targets are named before renaming has run, so the obfuscated method names are
+        // usually unusable (control characters). "key:<MethodKey>" addresses a method by
+        // its VM record, and a bare fragment also matches the declaring type, which is how
+        // a caller picks "everything on this form" without knowing a single method name.
+        private static bool Matches(VMMethod method, string fragment)
+        {
+            if (fragment.StartsWith("key:", StringComparison.OrdinalIgnoreCase))
+            {
+                return int.TryParse(fragment.Substring(4), out var key) && method.MethodKey == key;
+            }
+
+            var fullName = method.Parent?.FullName ?? string.Empty;
+            return fullName.IndexOf("::" + fragment + "(", StringComparison.Ordinal) >= 0 ||
+                   fullName.IndexOf(fragment, StringComparison.Ordinal) >= 0;
+        }
+
         public static JointSolverResult Solve(
             DevirtualizationCtx ctx,
             IDictionary<int, HashSet<VMOpCode>> candidates,
@@ -48,13 +64,11 @@ namespace Krypton.Pipeline.Stages
             var methods = ctx.VirtualizedMethods
                 .Where(m => m?.MethodBody?.Instructions != null &&
                             m.MethodBody.Instructions.Count > 0 &&
-                            targetFragments.Any(f =>
-                                (m.Parent?.FullName ?? string.Empty).IndexOf(
-                                    "::" + f + "(", StringComparison.Ordinal) >= 0))
+                            targetFragments.Any(f => Matches(m, f)))
                 .ToList();
 
             foreach (var m in methods)
-                result.TargetMethods.Add($"{m.Parent?.Name} ({m.MethodBody.Instructions.Count} vm)");
+                result.TargetMethods.Add($"{m.Parent?.Name ?? "key:" + m.MethodKey} ({m.MethodBody.Instructions.Count} vm)");
 
             if (methods.Count == 0)
             {
@@ -119,6 +133,12 @@ namespace Krypton.Pipeline.Stages
                     {
                         return false;
                     }
+
+                    // Depth alone cannot separate two opcodes of the same shape.
+                    // Metadata types can, and they are as independent of the
+                    // opcode table as the depths are.
+                    if (!TypedStackConstraint.IsTypeConsistent(ctx, m, assignment, out _, out _))
+                        return false;
                 }
 
                 return true;

@@ -288,6 +288,7 @@ namespace Krypton.Pipeline.Stages
         {
             var strict = IsStrictMappingMode();
             InferTailTerminatorRetMappings(ctx);
+            SolveOpcodesFromRuntimeFieldValues(ctx);
             ApplyEnvironmentOpcodeOverrides(ctx);
             if (strict && IsEnvironmentEnabled("KRYPTON_ENABLE_STRICT_BRANCH_RESOLVER", true))
                 ResolveRemainingUnknownBranchesStrict(ctx);
@@ -451,6 +452,7 @@ namespace Krypton.Pipeline.Stages
             new[]
             {
                 "metadata-signature", "global-stack-proof", "env-override",
+                RuntimeFieldTruthSource,
                 RuntimeTraceAnchors.EvidenceSource
             },
             StringComparer.Ordinal);

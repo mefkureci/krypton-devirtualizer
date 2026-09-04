@@ -3824,7 +3824,18 @@ namespace Krypton.Pipeline.Stages
             if (member is IMethodDescriptor method)
                 return new CilInstruction(CilOpCodes.Ldtoken, method);
 
-            throw new DevirtualizationException($"Token 0x{token:X8} cannot be resolved as type/field/method for ldtoken.");
+            if (IsStrictDiagnostics(ctx))
+                throw new DevirtualizationException($"Token 0x{token:X8} cannot be resolved as type/field/method for ldtoken.");
+
+            // Ldtoken and Ldc_I4 share the exact same stack shape (0 pop, 1 push, int32 operand),
+            // so a VM byte that is genuinely Ldc_I4 in this context can still get classified as
+            // Ldtoken by the structural/context scorers (they are indistinguishable without
+            // resolving the operand). When the operand does not resolve to any real
+            // type/field/method it is not a metadata token at all - treat it as the plain int32
+            // constant it actually is instead of failing the whole method.
+            ctx.Options.Logger.Warning(
+                $"Token 0x{token:X8} does not resolve to a type/field/method for ldtoken; treating operand as an Ldc_I4 constant instead.");
+            return new CilInstruction(CilOpCodes.Ldc_I4, token);
         }
 
         private CilInstruction BuildLdobjInstruction(DevirtualizationCtx ctx, object operand)
