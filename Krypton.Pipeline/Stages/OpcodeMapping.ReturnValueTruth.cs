@@ -24,6 +24,7 @@ namespace Krypton.Pipeline.Stages
         internal const string EvidenceSource = "return-oracle-override";
 
         private const int MaxRounds = 4;
+        private const long StaticProofNodeBudget = 2_000_000L;
         private const int MaxOracleCandidates = 256;
         private const int MaxOracleInstructions = 128;
 
@@ -210,7 +211,11 @@ namespace Krypton.Pipeline.Stages
                 JointSolverResult joint;
                 try
                 {
-                    joint = TargetedJointSolver.Solve(ctx, candidates, new[] { "key:" + method.MethodKey });
+                    // A budget, because this runs over every method: a search that
+                    // does not finish quickly here has nothing to prove anyway, since
+                    // only an exhausted search counts.
+                    joint = TargetedJointSolver.Solve(
+                        ctx, candidates, new[] { "key:" + method.MethodKey }, StaticProofNodeBudget);
                 }
                 catch
                 {

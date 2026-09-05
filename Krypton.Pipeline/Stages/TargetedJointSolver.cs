@@ -62,7 +62,8 @@ namespace Krypton.Pipeline.Stages
         public static JointSolverResult Solve(
             DevirtualizationCtx ctx,
             IDictionary<int, HashSet<VMOpCode>> candidates,
-            IReadOnlyCollection<string> targetFragments)
+            IReadOnlyCollection<string> targetFragments,
+            long nodeBudget = MaxNodes)
         {
             var result = new JointSolverResult();
             if (ctx?.VirtualizedMethods == null)
@@ -156,7 +157,7 @@ namespace Krypton.Pipeline.Stages
             {
                 if (capped)
                     return;
-                if (explored >= MaxNodes || feasible >= MaxFeasible)
+                if (explored >= nodeBudget || feasible >= MaxFeasible)
                 {
                     capped = true;
                     return;
