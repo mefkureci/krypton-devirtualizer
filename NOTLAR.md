@@ -327,3 +327,83 @@ Baseline ölçümü (override'sız, referans): ilverify toplam 83 hata — 63'ü
 zararsız `ThisUninitReturn` (Reactor'ın kendi stub'lanmış .ctor'ları),
 19'u Form1'de (`method_25` 3, `method_26` 13, `method_27` 2 + 1 ReturnEmpty),
 1 `UnmanagedPointer`. Bu 19 hata, 5 override uygulandığında 0'a iniyor.
+
+### 2026-09-05 (2) — ölçüm yapıldı: tip kontrolü daraltıyor, ama bir ARAÇ HATASI açığa çıktı
+
+**Ölçüm 1 (tip kontrolü metot-başına aramaya bağlı, override'lı koşu).** Daraltma
+gerçek: `method_26`'da aday sayıları `0x09` 26→**4**, `0x89` 11→**6**, arama uzayı
+556920→112320, uygun atama 200584→**88920**; `method_27`'de 4892→3240.
+AMA sonuç YANLIŞTI: `0x09`'dan **`Dup` elendi** (kalanlar `EndFinally, Ret,
+Rethrow, Throw` — yine kırpma-çekicisi). Yani tip geçişi DOĞRU CEVABI çürütüyordu.
+
+**Teşhis için kalıcı öz-kontrol eklendi** (`SemanticValidation.ReportTypeCheckerDisagreements`):
+her metot için ŞU AN GÖNDERİLEN eşlemeyi tip denetleyicisinden geçirir; çürütülürse
+metot + VM index + byte + sebep loglanır. Tip geçişi yalnızca aday ELEMEK için
+kullanıldığından, gönderilen eşlemenin çürütülmesi ya gerçek bir eşleme hatası ya da
+denetleyici hatasıdır — ikisi de görünür olmalı. İlk çalıştırmada tek satırda
+kök nedeni verdi:
+```
+[type-check] refuted in MethodKey 629 at VM index 1 (vm 0x89):
+             Newarr wants Int32 in argument slot 0 but the stack holds a value type
+```
+
+**ASIL ARAÇ HATASI (genel, bu hedefe özel değil) — `Ldtoken` operand-türü.**
+`TypeConstraintAnchoring.IsOperandUsageCompatible`, `Ldtoken`'ı
+`Newarr/Box/Unbox_Any/Ldobj/Isinst/Castclass/Constrained/Ldelema/Stobj` ile aynı
+`case` grubuna koyup operandının **ITypeDefOrRef** olmasını şart koşuyordu. Oysa
+`ldtoken` tip, **alan** veya metot token'ı alabilir — katalogda zaten öyle tanımlı
+(`VMMetadataTokenKind.Any`, `VMOpCodeCatalog.cs:164`) ve fonksiyonun başındaki genel
+kontrol bunu doğru uyguluyor; alttaki switch onu çelişkili biçimde daraltıyordu.
+Sonuç: `ldtoken <field>; call RuntimeHelpers::InitializeArray` deseni — .NET'te HER
+dizi/string sabiti başlatıcısının standart kalıbı — kullanan her byte'tan `Ldtoken`
+siliniyor, byte'a tek aday olarak `Ldc_I4` kalıyordu. `method_27`'de bu, `0x22`'yi
+`{Ldc_I4}`'e kilitledi → `InitializeArray`'in `RuntimeFieldHandle` argümanı hiçbir
+atamada sağlanamaz oldu → TÜM doğru atamalar çürüdü → geriye yalnızca metodu 2.
+komutta kesen terminal opcode'lar kaldı. Kırpma-çekicisi burada scoring'den değil,
+**boş bırakılmış bir aday kümesinden** doğuyordu.
+FIX: `case VMOpCode.Ldtoken:` o gruptan çıkarıldı (neden yorumla yazıldı).
+DOĞRULANDI: `0x22` 1→2 aday (`Ldc_I4, Ldtoken`), `0x09` artık `Dup`'ı KORUYOR
+(26→15), hiçbir metotta yanlış çürütme yok.
+
+**İkinci düzeltme — `Ldtoken`/`Ldc_I4` alçaltma yalanı.** `MethodRecompiling.
+BuildLdtokenInstruction` operandı hiçbir üyeye çözülmeyen bir `Ldtoken`'ı `Ldc_I4`
+olarak yayıyor (bilinen, kasıtlı geri düşüş). Tip denetleyicisi ise eşlemeye bakıp
+"değer tipi" varsayıyordu → öz-kontrol `0x4F`/`0x07` üzerinden gürültü üretiyordu.
+`TypedStackConstraint` artık alçaltıcıyı birebir modelliyor: operand çözülmüyorsa
+`Ldtoken` **Int32** üretir. (Derlendi; doğrulama koşusu bu notu yazarken sürüyor.)
+
+**ÖLÇÜM 2 SONUCU (Ldtoken fix'i ile): yeni ÇAPA YOK.**
+`resolution states: ANCHORED=1 UNRESOLVED=47 INCONCLUSIVE=3` — tek çapa hâlâ
+`0x71→Ldloc`. Yani yanlış çürütme giderildi ama 5 byte hâlâ kanıtlanamıyor.
+
+**NEDEN kanıtlanamıyor (teşhis, tahmin değil):** metot-başına arama bir adayı ancak
+HİÇBİR uygun atamada görünmüyorsa eliyor. `0x50`(Stelem_Ref), `0x4B`(Ldlen),
+`0x00`(Conv_I4) modülde YALNIZCA birer metotta geçiyor (sırasıyla method_26,
+method_25 ×2), dolayısıyla metotlar-arası kesişim kaldıracı yok; aynı metotta ise
+`0x5C`(90 aday), `0x9B`, `0x89` gibi byte'lar serbestken derinlik+tip kurallarına
+uyan ama anlamsız on binlerce atama var (method_26: 88920). Kısıtlar sağlam, sinyal
+zayıf.
+
+**SIRADAKİ ADIM (önerilen, henüz yapılmadı): metot-dönüş-değeri oracle'ı.**
+`RuntimeFieldTruth` deseninin aynısı, alan değerleri yerine dönüş değerleriyle:
+korumalı orijinal exe'de `method_27()` = `"UNPACKED"`, `method_26()` = 11 parçalı
+base64 GÖZLEMLENEBİLİR. Aday atamayı derleyip çalıştırıp çıktıyı gözlemlenene
+karşı test etmek `0x09/0x89/0x22`'yi tek çözüme indirir — çünkü bu bir kanıt,
+oy değil. Aynı mekanizma `0x50` için `method_26`'yı, `0x4B/0x00` için
+`method_25`'i (girdi/çıktı çifti bilinen AES yolu) kapsar.
+
+**Ek iki düzeltme (aynı oturum, doğrulandı):**
+- `TypedStackConstraint` artık `MethodRecompiling`'in alçaltmasını birebir modelliyor:
+  operandı hiçbir üyeye çözülmeyen `Ldtoken` **Int32** üretir (recompiler onu zaten
+  `Ldc_I4` olarak yayıyor). Öz-kontrol gürültüsü 3→2 satıra indi ve kalan iki satır
+  GERÇEK: `0x97` doğrulama-öncesi `Ldtoken` eşlenmiş (olması gereken `Ldstr`;
+  anchoring de "3 kısıt bunu eliyor" diyor) ve `method_274`'te `0x07=Shl`'in komşusu
+  aynı sınıf hatayı taşıyor.
+- `BuildLdtokenInstruction` uyarı seli: modülde **542 farklı** çözülemeyen sabit
+  `Ldtoken` sanılıyor ve her biri her recompile turunda loglanıyordu. Artık token
+  başına bir kez, en fazla 8 örnek + tek bir "gerisi bastırıldı" satırı.
+  Ölçüldü: uyarı 1084→**16**, toplam log 1673→**572** satır; üretilen exe birebir
+  aynı kalitede (ilverify 64 hata, Form1'de 0).
+
+**Bu oturumda DEĞİŞMEYEN:** 5 override hâlâ gerekli, yeni çapa yok, WFA37
+regresyon koşusu yapılmadı.

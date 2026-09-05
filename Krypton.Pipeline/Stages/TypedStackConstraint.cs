@@ -476,7 +476,15 @@ namespace Krypton.Pipeline.Stages
                 }
 
                 case VMOpCode.Ldtoken:
-                    return new[] { ValueTypeKind };
+                    // MethodRecompiling lowers an ldtoken whose operand resolves to
+                    // nothing as the plain Ldc_I4 constant it really is, so that is
+                    // the type this slot actually carries.
+                    return new[]
+                    {
+                        TypeConstraintAnchoring.Lookup(ctx, operand as int? ?? 0) == null
+                            ? StackTypeKind.Int32
+                            : ValueTypeKind
+                    };
 
                 case VMOpCode.Ldarg:
                     return new[] { ArgumentKind(method, operand) };

@@ -40,6 +40,8 @@ namespace Krypton.Pipeline.Stages
                 foreach (var line in TypeConstraintAnchoring.FormatSummary(typeOutcome).Split('\n'))
                     ctx.Options.Logger.Info(line.TrimEnd());
 
+                ReportTypeCheckerDisagreements(ctx);
+
                 // Runtime observations belong here: they read the interpreter's actual
                 // behaviour rather than the opcode table, so they are pinned alongside
                 // the metadata anchors and before any search runs. Entries that
@@ -4410,5 +4412,40 @@ namespace Krypton.Pipeline.Stages
             public VMOpCode OpCode { get; }
             public OpcodeMappingConfidence Confidence { get; }
         }
+
+        // The type pass is only ever used to refute candidates, so a refutation of
+        // the mapping actually being shipped is either a real mapping error or a
+        // bug in the pass itself. Either way it belongs in the log rather than
+        // silently narrowing the search away from the truth.
+        private static void ReportTypeCheckerDisagreements(DevirtualizationCtx ctx)
+        {
+            foreach (var method in ctx.VirtualizedMethods)
+            {
+                var instructions = method?.MethodBody?.Instructions;
+                if (instructions == null || instructions.Count == 0)
+                    continue;
+
+                var mapping = new Dictionary<int, VMOpCode>();
+                foreach (var instruction in instructions)
+                {
+                    if (instruction == null || mapping.ContainsKey(instruction.VmByte))
+                        continue;
+                    if (ctx.PatternMatcher.IsOpCodeValueKnown(instruction.VmByte))
+                        mapping[instruction.VmByte] = ctx.PatternMatcher.GetOpCodeValue(instruction.VmByte);
+                }
+
+                if (mapping.Count == 0)
+                    continue;
+
+                if (TypedStackConstraint.IsTypeConsistent(ctx, method, mapping, out var reason, out var index))
+                    continue;
+
+                var vmByte = index >= 0 && index < instructions.Count ? instructions[index].VmByte : -1;
+                ctx.Options.Logger.Warning(
+                    $"  [type-check] the current mapping is refuted in MethodKey {method.MethodKey} " +
+                    $"at VM index {index} (vm 0x{vmByte:X2}): {reason}");
+            }
+        }
+
     }
 }

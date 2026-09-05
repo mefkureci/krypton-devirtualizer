@@ -1317,11 +1317,16 @@ namespace Krypton.Pipeline.Stages
                             }
                             break;
 
+                        // Ldtoken deliberately absent: it takes a type, field *or*
+                        // method token, and the catalog already declares that as
+                        // VMMetadataTokenKind.Any above. Demanding a type token here
+                        // refuted it on every `ldtoken <field>; call InitializeArray`
+                        // array initializer, which left such bytes with Ldc_I4 as the
+                        // only candidate and made every correct assignment infeasible.
                         case VMOpCode.Newarr:
                         case VMOpCode.Box:
                         case VMOpCode.Unbox_Any:
                         case VMOpCode.Ldobj:
-                        case VMOpCode.Ldtoken:
                         case VMOpCode.Isinst:
                         case VMOpCode.Castclass:
                         // These also carry a type token, and leaving them out let a

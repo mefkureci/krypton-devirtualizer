@@ -3811,6 +3811,9 @@ namespace Krypton.Pipeline.Stages
             throw new DevirtualizationException($"Token 0x{token:X8} is not a type reference.");
         }
 
+        private const int LdtokenFallbackReportLimit = 8;
+        private readonly HashSet<int> _reportedLdtokenFallbacks = new HashSet<int>();
+
         private CilInstruction BuildLdtokenInstruction(DevirtualizationCtx ctx, object operand)
         {
             if (!(operand is int token))
@@ -3833,8 +3836,24 @@ namespace Krypton.Pipeline.Stages
             // resolving the operand). When the operand does not resolve to any real
             // type/field/method it is not a metadata token at all - treat it as the plain int32
             // constant it actually is instead of failing the whole method.
-            ctx.Options.Logger.Warning(
-                $"Token 0x{token:X8} does not resolve to a type/field/method for ldtoken; treating operand as an Ldc_I4 constant instead.");
+            // The same constant appears on every instruction that carries it, and a
+            // byte the scorers called Ldtoken can carry hundreds of distinct ones.
+            // A handful of examples plus one suppression line says what the flood
+            // said: this byte is Ldc_I4, not Ldtoken.
+            if (_reportedLdtokenFallbacks.Add(token))
+            {
+                if (_reportedLdtokenFallbacks.Count <= LdtokenFallbackReportLimit)
+                {
+                    ctx.Options.Logger.Warning(
+                        $"Token 0x{token:X8} does not resolve to a type/field/method for ldtoken; treating operand as an Ldc_I4 constant instead.");
+                }
+                else if (_reportedLdtokenFallbacks.Count == LdtokenFallbackReportLimit + 1)
+                {
+                    ctx.Options.Logger.Warning(
+                        "Further unresolvable ldtoken operands are being lowered as Ldc_I4 constants without individual warnings.");
+                }
+            }
+
             return new CilInstruction(CilOpCodes.Ldc_I4, token);
         }
 
