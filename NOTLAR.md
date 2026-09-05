@@ -407,3 +407,29 @@ oy değil. Aynı mekanizma `0x50` için `method_26`'yı, `0x4B/0x00` için
 
 **Bu oturumda DEĞİŞMEYEN:** 5 override hâlâ gerekli, yeni çapa yok, WFA37
 regresyon koşusu yapılmadı.
+
+### 2026-09-05 (3) — build-all.ps1 artık Krypton.Runner'ı da derliyor + çalışma-zamanı doğrulaması
+
+`build-all.ps1`, `Krypton.Runner`'ı (Krypton'un alt süreç olarak başlattığı .NET
+Framework gözlemci hostu) derlemiyordu; proje referansı olmadığı için hiçbir şey onu
+build'e sokmuyor, `Krypton\bin\Release\net8.0`'a kopyalamıyordu. Eksik olduğunda
+NecroBit dumper'ı ve runtime-alan opcode çözücüsü HATA VERMEDEN sessizce devre dışı
+kalıyor — en pahalı arıza türü. Artık script Runner'ı restore+build edip
+`Krypton.Runner.exe/.config/.pdb` + `dnlib/0Harmony/Newtonsoft.Json`'ı host çıktısına
+kopyalıyor; bulunamazsa açık uyarı basıyor. Sıfırdan (`bin` klasörleri silinerek)
+doğrulandı.
+
+**Doğrulama artık ilverify ile sınırlı değil.** `ilverify` "Form1'de 0 hata" dese bile
+program çalışırken `InvalidProgramException` atabiliyor, o yüzden üretilen exe artık
+yansımayla gerçekten çağrılarak sınanıyor (Windows PowerShell 5.1, -STA):
+```
+method_27() = UNPACKED
+method_26() = DRGeFGvStcxgMrGb1uZTI56tbMP2XHH+5LNEMyMz6oM=
+method_23('test123') = False      <- exception yok
+```
+Bu, override'lı temiz derlemeyle üretilen exe için geçerli.
+
+**Tekrarlanan karışıklık:** override'sız koşulan her Krypton çalıştırması, bu 5 byte'ı
+yine yanlış eşleyen (`0x09→Nop`, `0x89→Ldtoken`, `0x50→Shl`, `0x4B→Conv_U8`,
+`0x00→Ldlen`) ve butona basınca `method_23`'te çöken bir exe üretir. Raporun
+`source:env-override` içerip içermediğine bakmak bunu bir bakışta ayırt ettiriyor.
