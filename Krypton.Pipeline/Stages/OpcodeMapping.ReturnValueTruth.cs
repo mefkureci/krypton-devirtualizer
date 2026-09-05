@@ -46,7 +46,14 @@ namespace Krypton.Pipeline.Stages
         // measurement repeats until a round proves nothing new.
         public static void Apply(DevirtualizationCtx ctx)
         {
-            if (IsEnabled("KRYPTON_DISABLE_RETURN_VALUE_ORACLE"))
+            // Opt-in for now. What it proves is sound -- seven opcodes measured against
+            // what the protected assembly really returns -- but applying those proofs
+            // shifts what the later heuristics infer for the bytes still left over,
+            // and on this sample that shift currently costs more than it gains: the
+            // rebuilt program either fails to write or crashes on startup. Until the
+            // ldtoken/ldc.i4 mapping is decided per instruction rather than per byte
+            // (NOTLAR.md), the default pipeline stays exactly as it was.
+            if (!IsEnabled("KRYPTON_RETURN_VALUE_ORACLE"))
                 return;
             if (ctx?.VirtualizedMethods == null || ctx.PatternMatcher == null || ctx.Module == null)
                 return;
@@ -180,6 +187,51 @@ namespace Krypton.Pipeline.Stages
                 applied++;
             }
 
+            applied += ApplyStaticallyUniqueBytes(ctx, candidates);
+            return applied;
+        }
+
+        // Measurement settles bytes the rules could not reach, and settling them can
+        // make a *different* method's search collapse to one assignment. That is a
+        // proof in the same sense the solver already reports one, so it is applied
+        // here rather than waiting for a later heuristic to guess the same byte
+        // differently.
+        private static int ApplyStaticallyUniqueBytes(
+            DevirtualizationCtx ctx,
+            IDictionary<int, HashSet<VMOpCode>> candidates)
+        {
+            var applied = 0;
+            foreach (var method in ctx.VirtualizedMethods)
+            {
+                var instructions = method?.MethodBody?.Instructions;
+                if (instructions == null || instructions.Count == 0 || instructions.Count > MaxOracleInstructions)
+                    continue;
+
+                JointSolverResult joint;
+                try
+                {
+                    joint = TargetedJointSolver.Solve(ctx, candidates, new[] { "key:" + method.MethodKey });
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (!joint.Exhaustive || joint.Feasible == 0)
+                    continue;
+
+                foreach (var pair in joint.Proven)
+                {
+                    if (!ShouldRemap(ctx, pair.Key, pair.Value))
+                        continue;
+                    ApplyProvenMapping(ctx, pair.Key, pair.Value);
+                    ctx.Options.Logger.Warning(
+                        $"Joint proof: vm 0x{pair.Key:X2} -> {pair.Value} (MethodKey {method.MethodKey}, " +
+                        $"{joint.Feasible} feasible assignment(s), all agree).");
+                    applied++;
+                }
+            }
+
             return applied;
         }
 
@@ -223,15 +275,44 @@ namespace Krypton.Pipeline.Stages
             if (current == opCode)
                 return false;
 
-            // Ldtoken and Ldc_I4 share a shape and an operand, and the lowerer picks
-            // between them per instruction. Keeping the Ldtoken mapping to preserve
-            // that per-site choice was tried and is worse: with the measured bytes in
-            // place the writer could no longer build a body for method_23 at all, so
-            // the measurement wins here and the ldtoken sites are a known cost
-            // (recorded in NOTLAR.md).
+            // Ldtoken and Ldc_I4 share a shape and an operand, and the lowerer already
+            // picks between them per instruction: an operand that resolves to a type,
+            // field or method becomes ldtoken, anything else becomes the constant it
+            // is. Measuring Ldc_I4 in one method says what that method does, not what
+            // every other site does, and forcing the byte emits a constant where a
+            // handle was needed -- which is what stopped the rebuilt program from
+            // starting at all.
+            if (opCode == VMOpCode.Ldc_I4 && current == VMOpCode.Ldtoken &&
+                HasResolvableOperand(ctx, vmByte))
+            {
+                ctx.Options.Logger.Info(
+                    $"Return-value oracle: vm 0x{vmByte:X2} measured as Ldc_I4, but other sites carry resolvable " +
+                    "tokens; keeping the operand-driven Ldtoken lowering.");
+                return false;
+            }
+
             return true;
         }
 
+
+        private static bool HasResolvableOperand(DevirtualizationCtx ctx, int vmByte)
+        {
+            foreach (var method in ctx.VirtualizedMethods)
+            {
+                var instructions = method?.MethodBody?.Instructions;
+                if (instructions == null)
+                    continue;
+                foreach (var instruction in instructions)
+                {
+                    if (instruction == null || instruction.VmByte != vmByte || !(instruction.Operand is int token))
+                        continue;
+                    if (TypeConstraintAnchoring.Lookup(ctx, token) != null)
+                        return true;
+                }
+            }
+
+            return false;
+        }
 
         // The VM methods are already disassembled by the time this runs, so the
         // instructions carrying the byte are corrected alongside the table -- the
@@ -245,7 +326,6 @@ namespace Krypton.Pipeline.Stages
 
             ctx.OpcodeConfidence ??= new Dictionary<int, OpcodeMappingConfidence>();
             ctx.OpcodeConfidence[vmByte] = new OpcodeMappingConfidence(opCode, 1.0, EvidenceSource);
-            ctx.AnchoredOpcodes.Add(vmByte);
 
             foreach (var method in ctx.VirtualizedMethods)
             {

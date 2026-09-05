@@ -542,3 +542,49 @@ OLUŞMUYOR. Doğru çözüm muhtemelen byte başına değil KULLANIM başına e�
 **Sınır:** oracle yalnızca parametresiz metotları ölçebiliyor. `method_25(byte[],byte[])`
 gibi imzalar için argüman üretmek gerekir; bu turda gerekmedi çünkü onun byte'ları
 kaskattan çözüldü.
+
+### 2026-09-05 (6) — DÜZELTME: "sürükle-bırak çalışıyor" değerlendirmesi YANLIŞTI
+
+Bir önceki kayıttaki "artık override gerekmiyor, çalışıyor" sonucu **hatalı ölçüme**
+dayanıyordu. Doğrulama yansımayla `method_23/26/27`'yi çağırıyordu; bu üçü geçiyor
+AMA uygulamanın kendi başlangıç yolu (Main → Form1) hiç test edilmiyordu. Exe
+gerçekten başlatıldığında:
+```
+exit code 0xC0000005
+System.NullReferenceException at .Type_2.method_31()
+```
+**Ders: yansıma probe'u "program çalışıyor" demek değildir.** Bundan sonra doğrulama
+exe'yi gerçekten `Start-Process` ile başlatıp pencerenin açıldığını görmeyi de
+içermeli (`launch.ps1` deseni).
+
+**Ölçülen karşılaştırma:**
+
+| yapılandırma | ilverify | çıktı | başlatma |
+|---|---|---|---|
+| override'lar + oracle KAPALI (bilinen iyi) | 64 | var | **pencere açılıyor** |
+| oracle AÇIK, `0x4F` uygulanıyor | 146 | var | **açılışta çöküyor** (Type_2::method_31) |
+| oracle AÇIK, `0x4F` korunuyor (Ldtoken) | — | **YOK** | writer `method_23` gövdesini üretemiyor |
+
+Sebep zinciri (loglardan, tahmin değil): oracle'ın kanıtladığı 6-7 byte uygulanınca
+GERİYE KALAN byte'lar için sonraki sezgisel geçişler farklı karar veriyor. Bilinen
+iyi koşuda `0x4A -> Pop`, oracle koşusunda `0x4A -> Nop`, ayrıca `0x00 -> Ldlen`
+(yanlış) ve `0x4B -> Conv_U8` (yanlış) ve `0x53 -> Ret` (kesme çekicisi) çıkıyor.
+Yani sorun kanıtların yanlışlığı değil — kanıtlar sağlam — sorun, kanıtlanmamış
+byte'ların çıkarımının bu değişime karşı kırılgan olması.
+
+**KARAR: oracle opt-in yapıldı** (`KRYPTON_RETURN_VALUE_ORACLE=1`). Varsayılan boru
+hattı bu sabahki bilinen-iyi davranışıyla birebir aynı; doğrulandı: override'larla
+üretilen exe yine 64 ilverify hatası veriyor ve pencere açılıyor. Bugün eklenen
+diğer her şey (tip denetleyicisi, CLR geçerlilik kuralları, öz-kontrol) zaten
+`KRYPTON_TYPE_CONSTRAINTS` / `KRYPTON_GLOBAL_STACK_SOLVER` altında; varsayılan yolda
+`IsStackConsistent` ve `TypedStackConstraint` hiç çağrılmıyor (doğrulandı).
+
+**Sıradaki iş (net):**
+1. `Ldtoken` / `Ldc_I4` ayrımını byte başına değil KULLANIM başına yap. Oracle
+   `0x4F`'yi ölçtüğü yerde `Ldc_I4` kanıtlıyor ve haklı; ama aynı byte'ın operandı
+   başka yerlerde gerçek üyeye çözülüyor. Recompiler zaten operanda bakıyor —
+   eksik olan, eşleme tablosunun bu ikiliği taşıyamaması.
+2. `0x4B`/`0x00` hâlâ kanıtlanmış değil (yalnız `method_25`'te geçiyorlar ve o metot
+   parametreli olduğu için oracle ölçemiyor). Denenmemiş yol: ölçülen byte'larla
+   tohumlanmış metot-başına tekillik kanıtı (`ApplyStaticallyUniqueBytes` yazıldı,
+   ama koşusu 25 dk'da bitmediği için ölçülemedi — düğüm bütçesi gerekiyor).
