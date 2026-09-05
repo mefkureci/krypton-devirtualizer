@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -317,8 +317,16 @@ namespace Krypton.Pipeline.Stages
             if (index == order.Count)
             {
                 state.Nodes++;
-                if (!IsStackConsistent(ctx, method, assignment, complete: true, out _, out _))
+
+                // Once every byte in the method has a value, an assignment that leaves
+                // part of the stream unreachable is describing a method the VM never
+                // executes; requiring full reachability is what stops a terminal
+                // opcode from being an escape hatch for the rest of the search.
+                if (!IsStackConsistent(ctx, method, assignment, complete: true, out _, out _,
+                        requireFullReachability: true))
+                {
                     return;
+                }
                 if (!TypedStackConstraint.IsTypeConsistent(ctx, method, assignment, out _, out _))
                     return;
 
@@ -361,7 +369,8 @@ namespace Krypton.Pipeline.Stages
             IReadOnlyDictionary<int, VMOpCode> assignment,
             bool complete,
             out string reason,
-            out int failureIndex)
+            out int failureIndex,
+            bool requireFullReachability = false)
         {
             reason = null;
             failureIndex = -1;
@@ -440,6 +449,17 @@ namespace Krypton.Pipeline.Stages
                 if (!TryGetEffect(ctx, opcode, instruction.Operand, out var pop, out var push, out var flow))
                 {
                     reason = $"{opcode} cannot be lowered with this operand";
+                    failureIndex = index;
+                    return false;
+                }
+
+                // Endfinally, rethrow and leave are only legal inside the region they
+                // belong to. A method with no exception handlers at all cannot carry
+                // any of them, which is what keeps a byte from parking on one of these
+                // terminators purely to end the walk early.
+                if (!IsHandlerContextValid(method, opcode, index))
+                {
+                    reason = $"{opcode} appears outside the exception region it requires";
                     failureIndex = index;
                     return false;
                 }
@@ -555,6 +575,25 @@ namespace Krypton.Pipeline.Stages
             if (!complete)
                 return true;
 
+            // A byte mapped to a terminal opcode makes everything after it
+            // unreachable, and unreachable code cannot contradict anything -- so
+            // truncating assignments satisfy every check that only inspects what the
+            // walk visited. Requiring the whole stream to stay reachable removes that
+            // escape, but it is a claim about the sample (that the obfuscator emitted
+            // no dead VM code), not a rule of the CLR, so callers opt in per search
+            // rather than it holding module-wide.
+            if (requireFullReachability)
+            {
+                for (var i = 0; i < instructions.Count; i++)
+                {
+                    if (depths[i] != int.MinValue)
+                        continue;
+                    reason = $"instruction {i} is unreachable under this assignment";
+                    failureIndex = i;
+                    return false;
+                }
+            }
+
             for (var i = 0; i < instructions.Count; i++)
             {
                 if (depths[i] == int.MinValue)
@@ -566,15 +605,73 @@ namespace Krypton.Pipeline.Stages
                     continue;
                 if (flow != FlowKind.Fall || i + 1 < instructions.Count)
                     continue;
-                if (depths[i] - pop + push != 0)
-                {
-                    reason = "final instruction leaves values on the stack";
-                    failureIndex = i;
-                    return false;
-                }
+
+                // ECMA-335: the instruction stream must not fall off the end of a
+                // method. The last instruction has to transfer control -- ret, throw,
+                // br, leave, endfinally -- so a plain instruction sitting there is not
+                // a stack-depth question at all, it is an invalid method.
+                reason = "the last instruction falls off the end of the method";
+                failureIndex = i;
+                return false;
             }
 
             return true;
+        }
+
+        // Endfinally must sit in a finally or fault handler, rethrow in a catch or
+        // filter handler, and leave in a protected region or a catch-like handler.
+        private static bool IsHandlerContextValid(VMMethod method, VMOpCode opcode, int index)
+        {
+            if (opcode != VMOpCode.EndFinally && opcode != VMOpCode.Rethrow && opcode != VMOpCode.Leave)
+                return true;
+
+            var handlers = method?.MethodBody?.ExceptionHandlers;
+            if (handlers == null || handlers.Count == 0)
+                return false;
+
+            foreach (var handler in handlers)
+            {
+                if (handler == null)
+                    continue;
+
+                var inHandler = index >= handler.HandlerStart && index <= handler.HandlerEnd;
+                var inTry = index >= handler.TryStart && index <= handler.TryEnd;
+
+                switch (opcode)
+                {
+                    case VMOpCode.EndFinally:
+                        if (inHandler &&
+                            (handler.EHType == VMExceptionHandlerType.Finally ||
+                             handler.EHType == VMExceptionHandlerType.Fault))
+                        {
+                            return true;
+                        }
+
+                        break;
+
+                    case VMOpCode.Rethrow:
+                        if (inHandler &&
+                            (handler.EHType == VMExceptionHandlerType.Catch ||
+                             handler.EHType == VMExceptionHandlerType.Filter))
+                        {
+                            return true;
+                        }
+
+                        break;
+
+                    default:
+                        if (inTry ||
+                            (inHandler && handler.EHType != VMExceptionHandlerType.Finally &&
+                             handler.EHType != VMExceptionHandlerType.Fault))
+                        {
+                            return true;
+                        }
+
+                        break;
+                }
+            }
+
+            return false;
         }
 
         private static bool TryTarget(object operand, int count, out int target)

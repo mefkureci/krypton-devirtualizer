@@ -126,6 +126,26 @@ namespace Krypton.Pipeline.Stages
                 switch (flow)
                 {
                     case GlobalStackConstraintSolver.FlowKind.Return:
+                    {
+                        // The depth pass already knows a non-void method returns one
+                        // value; what it never checks is that the value has the
+                        // declared type. Ret models no pop, so the check belongs
+                        // here rather than in the popped-argument loop.
+                        var declared = Refine(method?.Parent?.Signature?.ReturnType);
+                        if (declared != StackTypeKind.Unknown && next.Length > 0)
+                        {
+                            var returned = next[next.Length - 1];
+                            if (!Satisfies(returned, declared))
+                            {
+                                reason = $"the method returns {Describe(declared)} but Ret leaves {Describe(returned)} on the stack";
+                                failureIndex = index;
+                                return false;
+                            }
+                        }
+
+                        break;
+                    }
+
                     case GlobalStackConstraintSolver.FlowKind.EndFinally:
                     case GlobalStackConstraintSolver.FlowKind.Throw:
                         break;
@@ -506,6 +526,13 @@ namespace Krypton.Pipeline.Stages
 
                 case VMOpCode.Ldnull:
                     return new[] { StackTypeKind.Unknown };
+
+                // TypedReference and the runtime handles are structs: they satisfy a
+                // struct-shaped requirement and nothing else, which is what separates
+                // them from the reference-producing opcodes of the same shape.
+                case VMOpCode.Mkrefany:
+                case VMOpCode.Refanytype:
+                    return new[] { ValueTypeKind };
             }
 
             if (VMOpCodeCatalog.IsArithmetic(opcode))

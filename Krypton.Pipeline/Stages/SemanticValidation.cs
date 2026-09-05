@@ -180,53 +180,54 @@ namespace Krypton.Pipeline.Stages
                     var fixpoint = SoundOpcodeFixpoint.Run(ctx, typeOutcome);
                     typeOutcome = fixpoint.Outcome;
 
-                    if (IsEnvironmentEnabled("KRYPTON_JOINT_TARGET_SOLVE"))
-                    {
-                        var jointTargets = (Environment.GetEnvironmentVariable("KRYPTON_JOINT_TARGET_METHODS") ?? string.Empty)
-                            .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
-                            .Select(n => n.Trim())
-                            .Where(n => n.Length > 0)
-                            .ToArray();
-
-                        if (jointTargets.Length > 0)
-                        {
-                            var joint = TargetedJointSolver.Solve(ctx, typeOutcome.Candidates, jointTargets);
-
-                            foreach (var line in TargetedJointSolver.Format(joint).Split('\n'))
-                                ctx.Options.Logger.Info(line.TrimEnd());
-
-                            foreach (var pair in joint.Proven)
-                            {
-                                if (typeOutcome.Candidates.TryGetValue(pair.Key, out var set) && set.Count > 1)
-                                {
-                                    set.Clear();
-                                    set.Add(pair.Value);
-                                }
-
-                                if (!typeOutcome.Anchors.ContainsKey(pair.Key))
-                                {
-                                    var rec = new AnchorRecord
-                                    {
-                                        VmByte = pair.Key,
-                                        OpCode = pair.Value,
-                                        Source = AnchorSource.CallArgument,
-                                        SiteCount = 0,
-                                        Round = 0
-                                    };
-                                    rec.Evidence.Add(
-                                        "GLOBALLY_PROVEN: unique assignment across the target methods " +
-                                        "under stack, CFG, EH, operand and type constraints");
-                                    typeOutcome.Anchors[pair.Key] = rec;
-                                }
-                            }
-                        }
-                    }
                     var inventoryPath = SoundOpcodeInventory.Write(ctx, fixpoint);
                     if (!string.IsNullOrWhiteSpace(inventoryPath))
                         ctx.Options.Logger.Info($"  sound opcode inventory: {inventoryPath}");
 
                     ctx.Options.Logger.Info(
                         $"  resolution states: ANCHORED={anchoredCount} UNRESOLVED={unresolvedCount} INCONCLUSIVE={inconclusiveCount}");
+                }
+
+                if (IsEnvironmentEnabled("KRYPTON_JOINT_TARGET_SOLVE"))
+                {
+                    var jointTargets = (Environment.GetEnvironmentVariable("KRYPTON_JOINT_TARGET_METHODS") ?? string.Empty)
+                        .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                        .Select(n => n.Trim())
+                        .Where(n => n.Length > 0)
+                        .ToArray();
+
+                    if (jointTargets.Length > 0)
+                    {
+                        var joint = TargetedJointSolver.Solve(ctx, typeOutcome.Candidates, jointTargets);
+
+                        foreach (var line in TargetedJointSolver.Format(joint).Split('\n'))
+                            ctx.Options.Logger.Info(line.TrimEnd());
+
+                        foreach (var pair in joint.Proven)
+                        {
+                            if (typeOutcome.Candidates.TryGetValue(pair.Key, out var set) && set.Count > 1)
+                            {
+                                set.Clear();
+                                set.Add(pair.Value);
+                            }
+
+                            if (!typeOutcome.Anchors.ContainsKey(pair.Key))
+                            {
+                                var rec = new AnchorRecord
+                                {
+                                    VmByte = pair.Key,
+                                    OpCode = pair.Value,
+                                    Source = AnchorSource.CallArgument,
+                                    SiteCount = 0,
+                                    Round = 0
+                                };
+                                rec.Evidence.Add(
+                                    "GLOBALLY_PROVEN: unique assignment across the target methods " +
+                                    "under stack, CFG, EH, operand and type constraints");
+                                typeOutcome.Anchors[pair.Key] = rec;
+                            }
+                        }
+                    }
                 }
 
                 if (IsEnvironmentEnabled("KRYPTON_APPLY_TYPE_ANCHORS"))

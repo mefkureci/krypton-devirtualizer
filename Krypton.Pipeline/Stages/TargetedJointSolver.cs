@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -129,7 +129,8 @@ namespace Krypton.Pipeline.Stages
                 foreach (var m in methods)
                 {
                     if (!GlobalStackConstraintSolver.IsStackConsistent(
-                            ctx, m, assignment, complete, out _, out _))
+                            ctx, m, assignment, complete, out _, out _,
+                            requireFullReachability: complete))
                     {
                         return false;
                     }

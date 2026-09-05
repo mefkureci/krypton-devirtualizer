@@ -433,3 +433,58 @@ Bu, override'lı temiz derlemeyle üretilen exe için geçerli.
 yine yanlış eşleyen (`0x09→Nop`, `0x89→Ldtoken`, `0x50→Shl`, `0x4B→Conv_U8`,
 `0x00→Ldlen`) ve butona basınca `method_23`'te çöken bir exe üretir. Raporun
 `source:env-override` içerip içermediğine bakmak bunu bir bakışta ayırt ettiriyor.
+
+### 2026-09-05 (4) — üç CLR geçerlilik kuralı: 0x89 artık ARAÇ TARAFINDAN kanıtlanıyor
+
+Sürükle-bırakta çöken exe'nin nedeni araçta bir bozulma değil: override'sız her koşu
+5 byte'ı yanlış eşliyor. Bunu kapatmak için çözücüye üç **sağlam** (CLR kuralı, skor
+değil) kısıt eklendi:
+
+1. **Metodun sonundan düşülemez.** ECMA-335: komut akışı metodun sonundan düşemez;
+   son komut kontrol aktarmalı (ret/throw/br/leave/endfinally). Eskiden yalnızca
+   "yığın 0 değilse hata" deniyordu, yani derinliği 0'a denk gelen sahte atamalar
+   geçiyordu. (`GlobalStackConstraintSolver`, complete kontrolü.)
+2. **`EndFinally`/`Rethrow`/`Leave` ait olduğu bölgenin dışında olamaz.**
+   `IsHandlerContextValid`: endfinally ancak finally/fault handler'ında, rethrow
+   ancak catch/filter handler'ında, leave ancak korumalı bölge veya catch-benzeri
+   handler içinde geçerli. Metotta HİÇ EH yoksa üçü de hiçbir yerde geçerli değil —
+   bir byte'ın "yürüyüşü erken bitirmek için" bu terminallere park etmesini engeller.
+3. **`Mkrefany`/`Refanytype` değer tipi üretir** (`TypedReference` struct'tır), yani
+   `Array` isteyen bir argümanı dolduramaz. (`TypedStackConstraint`.)
+   Ayrıca `Ret` artık **dönüş tipini** de kontrol ediyor (derinlik zaten kontrol
+   ediliyordu, tip hiç kontrol edilmiyordu).
+
+**Ölçülen etki (`method_27`, MethodKey 629, kapsamlı arama):**
+uygun atama 562 → **8**. Kanıtlananlar: `0x22=Ldtoken`, `0x4F=Ldc_I4`,
+`0x9C=Newobj`, `0x9D=Call`. Modül genelinde: **`0x89 -> Newarr` [ANCHORED]** —
+5 override'dan biri artık gerçekten kanıtlanıyor. `0x09` 26→3 (`Dup, Ldnull, Throw`),
+`0x5C` 90→2 (`Ret, Throw`).
+
+**Uçtan uca doğrulandı:** `KRYPTON_FORCE_VM_MAP`'ten `0x89` ÇIKARILIP
+`KRYPTON_TYPE_CONSTRAINTS=1 KRYPTON_JOINT_TARGET_SOLVE=1
+KRYPTON_JOINT_TARGET_METHODS=key:629 KRYPTON_APPLY_TYPE_ANCHORS=1` ile koşulduğunda
+rapor `0x89 -> Newarr, conf:1,00, source:metadata-signature` diyor ve program
+çalışıyor (`method_27()`="UNPACKED", `method_26()`=base64, `method_23('test123')`=False).
+
+**AMA çapaları uygulamak varsayılan yapılmadı:** aynı koşuda `ilverify` 64 → **146**
+(Form1'de 0 → 3). Yükselişin kaynağı `0x4F` çapası (Ldtoken→Ldc_I4 düzeltmesi):
+anchoring 15 kısıt sitesiyle Ldc_I4 diyor ve muhtemelen haklı, ama operandı gerçek
+bir metadata üyesine çözülen `0x4F` kullanımlarında çıktı değişip başka metotları
+bozuyor. Çalışma zamanı iyi, doğrulama kötü — çelişki çözülmeden `KRYPTON_APPLY_TYPE_ANCHORS`
+kapalı kalmalı. (İNCELENECEK.)
+
+**NEDEN geri kalan 4 byte hâlâ çözülemiyor (ölçüldü, tahmin değil):**
+Metot-başına arama bir adayı ancak HİÇBİR uygun atamada görünmüyorsa eliyor.
+`method_26`'da `0x50`'nin 90 adayının hepsi ayakta kalıyor çünkü aynı metottaki
+`0x9B` (8 aday: Stloc/Ldloc/Ldc_I4 ve dört `Br*_Un`) dallanma seçildiğinde CFG
+birleşme noktaları oluşuyor; birleşmede tipler `Unknown`'a genişliyor ve tip geçişi
+hiçbir şeyi çürütemez hale geliyor. Yani tek bir "vahşi" byte, aynı metottaki tüm
+diğer byte'ları geniş tutuyor. `0x09` için `Dup` vs `Ldnull` ve `0x5C` için
+`Ret` vs `Throw` ayrımı ise 6 metodun HİÇBİRİNDE statik olarak yapılamıyor:
+null bir dizi `stelem`e verilmek üzere yığına konabilir (statik olarak geçerli,
+runtime'da NullReferenceException) ve her zaman fırlatan bir metot da geçerli IL'dir.
+
+**SIRADAKİ KALDIRAÇ (değişmedi): metot-dönüş-değeri oracle'ı.** Korumalı orijinalde
+`method_27()`="UNPACKED" gözlemlenebiliyor; kalan 8 (artık ~2-4) aday atamayı
+üretip çalıştırıp gözlemle karşılaştırmak `0x09` ve `0x5C`'yi kanıta çevirir.
+`RuntimeFieldTruth` bunu alan değerleri için zaten yapıyor; mekanizma mevcut.
