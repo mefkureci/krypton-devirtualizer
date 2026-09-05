@@ -841,6 +841,14 @@ namespace Krypton.Runner
             }
 
             // --dump-fields <exe> <fields.json> [metadata-token...]
+            // --eval-vm-candidates <exe> <out.json> <plan.json>  - measures what the
+            // protected method really returns and reports which candidate opcode
+            // assignments reproduce it.
+            if (args.Length >= 4 && args[0] == "--eval-vm-candidates")
+            {
+                return ReturnValueOracleRunner.Run(args);
+            }
+
             if (args.Length >= 3 && args[0] == "--dump-fields")
             {
                 return RuntimeValueRunner.DumpFields(args);

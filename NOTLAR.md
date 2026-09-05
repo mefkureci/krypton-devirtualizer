@@ -488,3 +488,57 @@ runtime'da NullReferenceException) ve her zaman fırlatan bir metot da geçerli 
 `method_27()`="UNPACKED" gözlemlenebiliyor; kalan 8 (artık ~2-4) aday atamayı
 üretip çalıştırıp gözlemle karşılaştırmak `0x09` ve `0x5C`'yi kanıta çevirir.
 `RuntimeFieldTruth` bunu alan değerleri için zaten yapıyor; mekanizma mevcut.
+
+## 2026-09-05 (5) — DÖNÜŞ-DEĞERİ ORACLE'I: 5 override'ın HEPSİ kalktı, sürükle-bırak çalışıyor
+
+**Sonuç: `KRYPTON_FORCE_VM_MAP` artık gerekmiyor.** Ham exe'yi Krypton'a verince
+üretilen `Devirtualized.exe` çalışıyor; butona basınca `method_23` çökmüyor.
+Çalışma-zamanı doğrulaması (yansımayla gerçek çağrı):
+`method_27()`="UNPACKED", `method_26()`=11 parçalı base64, `method_23('test123')`=False.
+
+**Fikir.** Statik kurallar geçerliliğin sınırına kadar gider; ama `Dup` ile `Ldnull`,
+`Ret` ile `Throw` ikisi de GEÇERLİ IL üretir — aralarındaki fark ancak metodun ne
+HESAPLADIĞINDA görünür. Korumalı assembly bunu hâlâ hesaplıyor (yorumlayıcısı sağlam),
+yani cevap ölçülebilir: orijinal sanallaştırılmış metodu çağır, dönen değeri gör,
+sonra hayatta kalan aday atamaları çalıştır ve o değeri üretenleri tut.
+
+**Uygulama.**
+- `Krypton.Runner/ReturnValueOracleRunner.cs` + `--eval-vm-candidates <exe> <out> <plan>`:
+  orijinal metodu `FormatterServices.GetUninitializedObject` ile (ctor çalıştırmadan)
+  çağırıp gözlemler; sonra her aday atamayı **yorumlar**. IL üretmek yerine yorumlamak
+  bilinçli tercih: yanlış aday zaten exception atıp eleniyor, IL üretilse önce
+  doğrulanması gerekirdi. `Ldstr` operandı ham `#US` heap offset'i olduğu için
+  `0x70000000 | operand` ile token'a çevriliyor (bu atlanınca hiçbir aday tutmuyordu).
+- `Krypton.Pipeline/Stages/OpcodeMapping.ReturnValueTruth.cs` (`ReturnValueOracle`):
+  ölçülebilir metotları seçer (parametresiz, void olmayan, ≤128 komut), her biri için
+  `TargetedJointSolver` ile KAPSAMLI aday listesini alır, planı yazar, Runner'ı çağırır,
+  hayatta kalan atamaların hepsinde aynı değeri alan byte'ları kanıtlanmış sayar.
+  `SemanticValidation.Validate`'in EN BAŞINDA çalışır — eşleme aşamasında
+  `ctx.VirtualizedMethods` henüz dolu olmadığı için orada çalışmıyor (ilk deneme
+  sessizce hiçbir şey yapmamıştı).
+- **Turlu**: kanıtlanan byte'lar bir sonraki turda `Propagate`'e tohum olarak
+  besleniyor; bu olmadan tur 2 aynı sonucu veriyordu. Ölçüldü: tur 1 `method_27`'yi
+  4 adaya indirip 3 byte kanıtlıyor, tur 2'de `method_26` 57 adaya düşüp ölçülebilir
+  hale geliyor ve 4 byte daha kanıtlanıyor.
+
+**Kanıtlanan 7 opcode** (`source:return-oracle-override`, conf 1.00):
+`0x09=Dup`, `0x4F=Ldc_I4`, `0x89=Newarr`, `0x50=Stelem_Ref`, `0x71=Ldloc`,
+`0x97=Ldstr`, `0x9B=Stloc`. Bunların üçü (`0x09`, `0x89`, `0x50`) elle verilen
+override'lardı. Kalan iki override (`0x4B=Ldlen`, `0x00=Conv_I4`) ARTIK GEREKMİYOR:
+kanıtlananlar sayesinde `structural-usage` çıkarımı ikisini de kendiliğinden doğru
+buluyor (raporda `conf:0,99`).
+
+**AÇIK: `ilverify` 146 (override'lı eski çıktıda 64).** Tek fark `0x4F`: oracle onu
+ölçtüğü yerde `Ldc_I4` kanıtlıyor ve modül geneline uygulanıyor; oysa aynı byte'ın
+bazı kullanımlarında operand gerçek bir üyeye çözülüyor ve orada `ldtoken` doğru
+(recompiler zaten operanda bakıp seçiyordu). Hataların 79'u Reactor'ın kendi runtime
+tipinde (`??.Type_4`), kullanıcı kodunda sadece 3 tane var (`method_22` ×2,
+`method_23` ×1) ve program doğru çalışıyor.
+DENENDİ VE GERİ ALINDI: "0x4F Ldtoken kalsın" kuralı daha kötü — ölçülmüş diğer
+byte'larla birlikte writer `method_23`'ün gövdesini hiç üretemiyor ve ÇIKTI HİÇ
+OLUŞMUYOR. Doğru çözüm muhtemelen byte başına değil KULLANIM başına eşleme
+(operand çözülüyorsa ldtoken, çözülmüyorsa ldc.i4) — mimari iş, yapılmadı.
+
+**Sınır:** oracle yalnızca parametresiz metotları ölçebiliyor. `method_25(byte[],byte[])`
+gibi imzalar için argüman üretmek gerekir; bu turda gerekmedi çünkü onun byte'ları
+kaskattan çözüldü.

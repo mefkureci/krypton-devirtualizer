@@ -21,6 +21,12 @@ namespace Krypton.Pipeline.Stages
             new Dictionary<int, HashSet<VMOpCode>>();
         public IDictionary<int, VMOpCode> Proven { get; } = new Dictionary<int, VMOpCode>();
         public IList<int> Divergent { get; } = new List<int>();
+
+        // The surviving assignments themselves, not just their union. Static rules
+        // cannot separate two opcodes that are both valid IL; running them can, and
+        // running them needs the whole assignment.
+        public IList<IReadOnlyDictionary<int, VMOpCode>> FeasibleAssignments { get; } =
+            new List<IReadOnlyDictionary<int, VMOpCode>>();
     }
 
     // Closing sprint: instead of resolving the whole opcode table, solve only the
@@ -34,6 +40,7 @@ namespace Krypton.Pipeline.Stages
     internal static class TargetedJointSolver
     {
         private const long MaxNodes = 40_000_000L;
+        private const int MaxRetainedAssignments = 512;
         private const long MaxFeasible = 50_000L;
 
         // Targets are named before renaming has run, so the obfuscated method names are
@@ -164,6 +171,8 @@ namespace Krypton.Pipeline.Stages
                     feasible++;
                     foreach (var pair in assignment)
                         result.FeasibleValues[pair.Key].Add(pair.Value);
+                    if (result.FeasibleAssignments.Count < MaxRetainedAssignments)
+                        result.FeasibleAssignments.Add(new Dictionary<int, VMOpCode>(assignment));
                     return;
                 }
 

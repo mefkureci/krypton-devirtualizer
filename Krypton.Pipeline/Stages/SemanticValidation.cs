@@ -31,6 +31,11 @@ namespace Krypton.Pipeline.Stages
             if (!profile.Enabled)
                 return;
 
+            // Measured evidence first: what the protected assembly actually returns
+            // settles bytes that no static rule can, and everything below reasons
+            // about a table that is already correct where it could be measured.
+            ReturnValueOracle.Apply(ctx);
+
             // Metadata signatures and payload operand encoding are the only evidence
             // here that does not depend on the opcode table, so what they prove is
             // pinned before any inference runs and is never revisited afterwards.
