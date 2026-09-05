@@ -27,12 +27,17 @@ namespace Krypton.Pipeline.Stages
 
         private static readonly StackTypeKind[] NoKinds = Array.Empty<StackTypeKind>();
 
+        // focusVmByte narrows the verdict to one byte: violations at any other
+        // instruction are stepped over instead of ending the walk. Without it the
+        // first failure in a method hides every later one, so a byte that consumes
+        // an array as a number stays invisible behind someone else's mistake.
         public static bool IsTypeConsistent(
             DevirtualizationCtx ctx,
             VMMethod method,
             IReadOnlyDictionary<int, VMOpCode> assignment,
             out string reason,
-            out int failureIndex)
+            out int failureIndex,
+            int focusVmByte = -1)
         {
             reason = null;
             failureIndex = -1;
@@ -77,7 +82,14 @@ namespace Krypton.Pipeline.Stages
 
                 var merged = Merge(states[index], incoming, out var changed);
                 if (merged == null)
-                    return true; // depth disagreement: not this pass's verdict
+                {
+                    // Two paths reach here with different depths. That is the depth
+                    // pass's verdict, not this one's -- but abandoning the whole
+                    // method over it means everything downstream goes unchecked,
+                    // which is how a byte consuming an array as a number stayed
+                    // invisible. Drop this arrival and keep walking the rest.
+                    continue;
+                }
                 if (states[index] != null && !changed)
                     continue;
                 states[index] = merged;
@@ -99,7 +111,8 @@ namespace Krypton.Pipeline.Stages
                     return true; // underflow is the depth pass's verdict
 
                 var required = RequiredKinds(ctx, method, opcode, instruction.Operand, pop);
-                for (var slot = 0; slot < pop; slot++)
+                var ignoreViolations = focusVmByte >= 0 && instruction.VmByte != focusVmByte;
+                for (var slot = 0; slot < pop && !ignoreViolations; slot++)
                 {
                     // required is bottom-to-top over the popped window.
                     var actual = merged[merged.Length - pop + slot];
@@ -132,7 +145,7 @@ namespace Krypton.Pipeline.Stages
                         // declared type. Ret models no pop, so the check belongs
                         // here rather than in the popped-argument loop.
                         var declared = Refine(method?.Parent?.Signature?.ReturnType);
-                        if (declared != StackTypeKind.Unknown && next.Length > 0)
+                        if (!ignoreViolations && declared != StackTypeKind.Unknown && next.Length > 0)
                         {
                             var returned = next[next.Length - 1];
                             if (!Satisfies(returned, declared))
@@ -444,7 +457,12 @@ namespace Krypton.Pipeline.Stages
 
                 case VMOpCode.Neg:
                 case VMOpCode.Not:
+                case VMOpCode.Localloc:
                     return new[] { AnyNumeric };
+
+                case VMOpCode.Refanyval:
+                case VMOpCode.Refanytype:
+                    return new[] { ValueTypeKind };
             }
 
             if (VMOpCodeCatalog.IsConversion(opcode))

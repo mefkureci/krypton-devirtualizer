@@ -973,7 +973,7 @@ namespace Krypton.Pipeline.Stages
                 case VMOpCode.Stfld:
                     return new CilInstruction(CilOpCodes.Stfld, ResolveFieldDescriptor(ctx, instruction.Operand));
                 case VMOpCode.Ldc_I4:
-                    return new CilInstruction(CilOpCodes.Ldc_I4, Convert.ToInt32(instruction.Operand));
+                    return BuildLdcI4Instruction(ctx, instruction.Operand);
                 case VMOpCode.Ldc_I8:
                     return new CilInstruction(CilOpCodes.Ldc_I8, Convert.ToInt64(instruction.Operand));
                 case VMOpCode.Ldc_R4:
@@ -3405,15 +3405,32 @@ namespace Krypton.Pipeline.Stages
             CilMethodBody body,
             IList<CilInstruction> translatedInstructionMap)
         {
+            // The passes that run before this one drop instructions from the body --
+            // unreachable ones, mostly -- while the VM-index map still points at the
+            // objects they dropped. Labelling those produces a body whose handler
+            // boundaries reference instructions that are not in it, which the writer
+            // rejects outright ("references an instruction that is not present in the
+            // method body") and the whole output is lost. So every boundary resolves
+            // to an instruction the body still contains.
+            var present = new HashSet<CilInstruction>(body.Instructions);
+
             foreach (var vmEh in vmMethod.MethodBody.ExceptionHandlers)
             {
+                var tryStart = GetSurvivingInstructionAt(translatedInstructionMap, present, vmEh.TryStart);
+                var handlerStart = GetSurvivingInstructionAt(translatedInstructionMap, present, vmEh.HandlerStart);
+
+                // A region whose start is gone no longer describes anything in this
+                // body; keeping it would only reintroduce the dangling label.
+                if (tryStart == null || handlerStart == null)
+                    continue;
+
                 var cilEh = new CilExceptionHandler
                 {
                     HandlerType = MapExceptionHandlerType(vmEh.EHType),
-                    TryStart = GetInstructionAt(translatedInstructionMap, vmEh.TryStart, "try start"),
-                    TryEnd = GetInstructionBoundary(translatedInstructionMap, vmEh.TryEnd + 1),
-                    HandlerStart = GetInstructionAt(translatedInstructionMap, vmEh.HandlerStart, "handler start"),
-                    HandlerEnd = GetInstructionBoundary(translatedInstructionMap, vmEh.HandlerEnd + 1)
+                    TryStart = tryStart,
+                    TryEnd = GetSurvivingBoundary(translatedInstructionMap, present, vmEh.TryEnd + 1),
+                    HandlerStart = handlerStart,
+                    HandlerEnd = GetSurvivingBoundary(translatedInstructionMap, present, vmEh.HandlerEnd + 1)
                 };
 
                 switch (vmEh.EHType)
@@ -3422,12 +3439,47 @@ namespace Krypton.Pipeline.Stages
                         cilEh.ExceptionType = ResolveExceptionType(vmEh.CatchType);
                         break;
                     case VMExceptionHandlerType.Filter:
-                        cilEh.FilterStart = GetInstructionAt(translatedInstructionMap, vmEh.Filter, "filter start");
+                        cilEh.FilterStart =
+                            GetSurvivingInstructionAt(translatedInstructionMap, present, vmEh.Filter);
+                        if (cilEh.FilterStart == null)
+                            continue;
                         break;
                 }
 
                 body.ExceptionHandlers.Add(cilEh);
             }
+        }
+
+        // A region start moves forward to the first instruction at or after it that
+        // survived; an instruction that is gone cannot be where a region begins.
+        private static ICilLabel GetSurvivingInstructionAt(
+            IList<CilInstruction> translatedInstructionMap,
+            HashSet<CilInstruction> present,
+            int index)
+        {
+            if (index < 0)
+                return null;
+
+            for (var i = index; i < translatedInstructionMap.Count; i++)
+            {
+                var instruction = translatedInstructionMap[i];
+                if (instruction != null && present.Contains(instruction))
+                    return new CilInstructionLabel(instruction);
+            }
+
+            return null;
+        }
+
+        // An exclusive end that no longer exists means the region runs to the end of
+        // the body, which is what a null boundary already denotes here.
+        private static ICilLabel GetSurvivingBoundary(
+            IList<CilInstruction> translatedInstructionMap,
+            HashSet<CilInstruction> present,
+            int index)
+        {
+            return index >= translatedInstructionMap.Count
+                ? null
+                : GetSurvivingInstructionAt(translatedInstructionMap, present, index);
         }
 
         private CilExceptionHandlerType MapExceptionHandlerType(VMExceptionHandlerType type)
@@ -3771,6 +3823,32 @@ namespace Krypton.Pipeline.Stages
             }
 
             return false;
+        }
+
+        // The mirror of BuildLdtokenInstruction. Ldtoken and Ldc_I4 have the same
+        // shape and the same operand, so one VM byte carries both: most of its
+        // operands are plain constants, and a few are real metadata tokens. The
+        // ldtoken direction already falls back to a constant when the operand
+        // resolves to nothing; without this direction, a byte the evidence puts on
+        // Ldc_I4 emits a constant at the sites that meant a handle, which is how a
+        // rebuilt program ends up failing inside the protection's own runtime.
+        //
+        // Only a type, field or method counts. Small integers do address rows of
+        // other metadata tables, and those must stay the constants they are.
+        private CilInstruction BuildLdcI4Instruction(DevirtualizationCtx ctx, object operand)
+        {
+            var value = Convert.ToInt32(operand);
+            switch (TryLookupMember(ctx, value))
+            {
+                case ITypeDefOrRef type:
+                    return new CilInstruction(CilOpCodes.Ldtoken, type);
+                case IFieldDescriptor field:
+                    return new CilInstruction(CilOpCodes.Ldtoken, field);
+                case IMethodDescriptor method:
+                    return new CilInstruction(CilOpCodes.Ldtoken, method);
+                default:
+                    return new CilInstruction(CilOpCodes.Ldc_I4, value);
+            }
         }
 
         private IMetadataMember TryLookupMember(DevirtualizationCtx ctx, int token)

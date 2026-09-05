@@ -24,7 +24,6 @@ namespace Krypton.Pipeline.Stages
         internal const string EvidenceSource = "return-oracle-override";
 
         private const int MaxRounds = 4;
-        private const long StaticProofNodeBudget = 2_000_000L;
         private const int MaxOracleCandidates = 256;
         private const int MaxOracleInstructions = 128;
 
@@ -47,14 +46,7 @@ namespace Krypton.Pipeline.Stages
         // measurement repeats until a round proves nothing new.
         public static void Apply(DevirtualizationCtx ctx)
         {
-            // Opt-in for now. What it proves is sound -- seven opcodes measured against
-            // what the protected assembly really returns -- but applying those proofs
-            // shifts what the later heuristics infer for the bytes still left over,
-            // and on this sample that shift currently costs more than it gains: the
-            // rebuilt program either fails to write or crashes on startup. Until the
-            // ldtoken/ldc.i4 mapping is decided per instruction rather than per byte
-            // (NOTLAR.md), the default pipeline stays exactly as it was.
-            if (!IsEnabled("KRYPTON_RETURN_VALUE_ORACLE"))
+            if (IsEnabled("KRYPTON_DISABLE_RETURN_VALUE_ORACLE"))
                 return;
             if (ctx?.VirtualizedMethods == null || ctx.PatternMatcher == null || ctx.Module == null)
                 return;
@@ -188,60 +180,9 @@ namespace Krypton.Pipeline.Stages
                 applied++;
             }
 
-            applied += ApplyStaticallyUniqueBytes(ctx, candidates);
             return applied;
         }
 
-        // Measurement settles bytes the rules could not reach, and settling them can
-        // make a *different* method's search collapse to one assignment. That is a
-        // proof in the same sense the solver already reports one, so it is applied
-        // here rather than waiting for a later heuristic to guess the same byte
-        // differently.
-        private static int ApplyStaticallyUniqueBytes(
-            DevirtualizationCtx ctx,
-            IDictionary<int, HashSet<VMOpCode>> candidates)
-        {
-            var applied = 0;
-            foreach (var method in ctx.VirtualizedMethods)
-            {
-                var instructions = method?.MethodBody?.Instructions;
-                if (instructions == null || instructions.Count == 0 || instructions.Count > MaxOracleInstructions)
-                    continue;
-
-                JointSolverResult joint;
-                try
-                {
-                    // A budget, because this runs over every method: a search that
-                    // does not finish quickly here has nothing to prove anyway, since
-                    // only an exhausted search counts.
-                    joint = TargetedJointSolver.Solve(
-                        ctx, candidates, new[] { "key:" + method.MethodKey }, StaticProofNodeBudget);
-                }
-                catch
-                {
-                    continue;
-                }
-
-                if (!joint.Exhaustive || joint.Feasible == 0)
-                    continue;
-
-                foreach (var pair in joint.Proven)
-                {
-                    if (!ShouldRemap(ctx, pair.Key, pair.Value))
-                        continue;
-                    ApplyProvenMapping(ctx, pair.Key, pair.Value);
-                    ctx.Options.Logger.Warning(
-                        $"Joint proof: vm 0x{pair.Key:X2} -> {pair.Value} (MethodKey {method.MethodKey}, " +
-                        $"{joint.Feasible} feasible assignment(s), all agree).");
-                    applied++;
-                }
-            }
-
-            return applied;
-        }
-
-        // Only evidence that stands on its own -- what the protected assembly was
-        // observed to do, or what the operator asserted -- is fed back as fact.
         private static Dictionary<int, HashSet<VMOpCode>> CollectMeasuredBytes(DevirtualizationCtx ctx)
         {
             var measured = new Dictionary<int, HashSet<VMOpCode>>();

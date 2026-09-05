@@ -579,6 +579,13 @@ namespace Krypton.Pipeline
                             $"Sanitized {sanitizedDeadInstructions} unreachable invalid instruction(s) before donor write.");
                     }
                 }
+                var repairedHandlers = RepairDanglingExceptionHandlerLabels(Ctx.Module);
+                if (repairedHandlers > 0)
+                {
+                    Ctx.Options.Logger.Warning(
+                        $"Repaired {repairedHandlers} dangling exception handler boundary/boundaries before donor write.");
+                }
+
                 NormalizeAssemblyIdentity(Ctx.Module);
                 WriteTemporaryDonorImage(tempPath, metadataBuilderFlags, stripMalformedAttributes, methodsToPatch);
 
@@ -811,6 +818,89 @@ namespace Krypton.Pipeline
                 return false;
 
             return error.ToString().IndexOf("Stack imbalance was detected", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        // Instructions are dropped from method bodies right up to the moment of
+        // writing -- the unreachable-instruction sanitiser is the last one -- while
+        // the exception handlers attached earlier still point at the objects that
+        // were dropped. AsmResolver refuses the entire image for that ("Try End ...
+        // references an instruction that is not present in the method body"), so a
+        // single stale boundary costs the whole output rather than one method.
+        //
+        // A boundary whose instruction is gone moves to the next instruction still
+        // in the body; a region with no surviving start no longer describes anything
+        // and is removed.
+        private static int RepairDanglingExceptionHandlerLabels(AsmResolver.DotNet.ModuleDefinition module)
+        {
+            var repaired = 0;
+
+            foreach (var type in module.GetAllTypes())
+            {
+                foreach (var method in type.Methods)
+                {
+                    var body = method.CilMethodBody;
+                    if (body == null || body.ExceptionHandlers.Count == 0)
+                        continue;
+
+                    var present = new HashSet<CilInstruction>(body.Instructions);
+
+                    for (var i = body.ExceptionHandlers.Count - 1; i >= 0; i--)
+                    {
+                        var handler = body.ExceptionHandlers[i];
+                        var changed = false;
+
+                        var tryStart = RepairHandlerLabel(handler.TryStart, present, body, ref changed);
+                        var tryEnd = RepairHandlerLabel(handler.TryEnd, present, body, ref changed);
+                        var handlerStart = RepairHandlerLabel(handler.HandlerStart, present, body, ref changed);
+                        var handlerEnd = RepairHandlerLabel(handler.HandlerEnd, present, body, ref changed);
+                        var filterStart = RepairHandlerLabel(handler.FilterStart, present, body, ref changed);
+
+                        if (!changed)
+                            continue;
+
+                        if (tryStart == null || handlerStart == null)
+                        {
+                            body.ExceptionHandlers.RemoveAt(i);
+                            repaired++;
+                            continue;
+                        }
+
+                        handler.TryStart = tryStart;
+                        handler.TryEnd = tryEnd;
+                        handler.HandlerStart = handlerStart;
+                        handler.HandlerEnd = handlerEnd;
+                        handler.FilterStart = filterStart;
+                        repaired++;
+                    }
+                }
+            }
+
+            return repaired;
+        }
+
+        private static ICilLabel RepairHandlerLabel(
+            ICilLabel label,
+            HashSet<CilInstruction> present,
+            CilMethodBody body,
+            ref bool changed)
+        {
+            if (!(label is CilInstructionLabel instructionLabel) || instructionLabel.Instruction == null)
+                return label;
+            if (present.Contains(instructionLabel.Instruction))
+                return label;
+
+            changed = true;
+
+            // The dropped instruction still carries the offset it had, so the region
+            // continues at the first surviving instruction at or after it.
+            var offset = instructionLabel.Instruction.Offset;
+            foreach (var candidate in body.Instructions)
+            {
+                if (candidate.Offset >= offset)
+                    return new CilInstructionLabel(candidate);
+            }
+
+            return null;
         }
 
         private int SanitizeUnreachableInvalidInstructions(AsmResolver.DotNet.ModuleDefinition module)

@@ -588,3 +588,50 @@ diğer her şey (tip denetleyicisi, CLR geçerlilik kuralları, öz-kontrol) zat
    parametreli olduğu için oracle ölçemiyor). Denenmemiş yol: ölçülen byte'larla
    tohumlanmış metot-başına tekillik kanıtı (`ApplyStaticallyUniqueBytes` yazıldı,
    ama koşusu 25 dk'da bitmediği için ölçülemedi — düğüm bütçesi gerekiyor).
+
+## 2026-09-05 (7) — override 5'ten 2'ye indi + gerçek bir yazıcı hatası düzeldi
+
+**1. YAZICI HATASI (genel, eşlemeden bağımsız).** `Devirtualizer`'daki modül geneli
+`SanitizeUnreachableInvalidInstructions` yazmadan hemen önce komut siliyor, ama
+istisna işleyicileri çoktan bağlanmış durumda. Tek bir bayat sınır AsmResolver'a
+tüm imajı reddettiriyordu ("Try End ... references an instruction that is not
+present in the method body") ve çalıştırma HİÇ çıktı üretmeden bitiyordu
+("Removed stale output file"). FIX: yazma öncesi `RepairDanglingExceptionHandlerLabels`
+— silinmiş komuta bakan sınır, o offset'ten sonraki ilk ayakta kalan komuta kayıyor;
+başlangıcı kalmayan bölge kaldırılıyor. Doğrulandı: çıktı yeniden üretiliyor.
+(Not: aynı düzeltmeyi önce `MethodRecompiling.ApplyExceptionHandlers` içinde yaptım,
+yanlış katmandı — oradaki sanitize zaten EH'den önce çalışıyor; asıl üretici modül
+geneli olanıydı.)
+
+**2. ORACLE VARSAYILAN AÇIK + operanda duyarlı `Ldc_I4`.** `MethodRecompiling`
+artık `Ldc_I4`'ü de operanda göre alçaltıyor (`BuildLdcI4Instruction`): operand
+gerçek bir tip/alan/metot token'ına çözülüyorsa `ldtoken`, değilse sabit — mevcut
+`Ldtoken`→`Ldc_I4` geri düşüşünün simetriği. Çift kullanımlı byte'lar (`0x4F`)
+artık her kullanım yerinde doğru komutu alıyor; startup çökmesi buydu.
+
+**3. TİP-ÇÜRÜTME ONARIMI** (`SemanticValidation.RepairTypeRefutedMappings`).
+Doğrulama bittikten sonra, mevcut eşlemesi kendi komutunda tip olarak imkânsız olan
+byte'lar için: diğer tüm byte'lar sabitken o byte serbest bırakılıp ortak çözücüyle
+aday kümesi alınıyor, mevcut aritede kalanlar süzülüyor, tek aday kalırsa
+uygulanıyor (int32 dönüşüm ailesinde kanonik `Conv_I4`). Yakınsayana kadar
+tekrarlanıyor. Bunu mümkün kılan iki düzeltme: `IsTypeConsistent`'a `focusVmByte`
+(ilk hata başka byte'ta olunca kalanı gizliyordu) ve birleşme derinliği uyuşmazlığında
+tüm metodu iptal etmek yerine o yolu atlamak. Ayrıca `Localloc`/`Refanytype` için
+girdi şartları eklendi — onlar olmadan `0x4B` üç adayda takılıyordu.
+
+**SONUÇ (ölçüldü):** `0x09=Dup`, `0x89=Newarr`, `0x50=Stelem_Ref` oracle ile
+KANITLANIYOR; `0x4B=Ldlen`, `0x00=Conv_I4` tip-çürütmesiyle otomatik düzeliyor.
+Kalan override sadece **iki byte**:
+```
+KRYPTON_FORCE_VM_MAP="0x4A=Pop;0x53=Conv_I4"
+```
+Bununla: ilverify 64, pencere açılıyor, `method_23('test123')`=False, çökme yok.
+
+**KALAN İKİ BYTE NEDEN ÇÖZÜLEMİYOR (iki deneme yapıldı, ikisi de GERİ ALINDI):**
+`0x4A` (Nop olmalıydı Pop) ve `0x53` (Ret olmalıydı Conv_I4) tip açısından görünmez.
+Denenen ölçüt "metot hiç tutarlı olamıyor → şüphelileri serbest bırak" idi; hem
+tam-tutarlılık (tip+EH+erişilebilirlik) hem yalnız-derinlik sürümü, dev
+`Type_4::method_59` (MethodKey 662) üzerinde `0x53`'ü **`Throw`** olarak "kanıtladı"
+— o metodun kendi eşlemesi de yanlış olduğu için orada dengeyi Throw kuruyor.
+Yani yanlış bir bağlam, yanlış bir kanıt üretiyor. İkisi de geri alındı; ölçüt
+güvenilir olmadan bu iki byte'a dokunulmamalı.

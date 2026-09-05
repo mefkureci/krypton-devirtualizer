@@ -24,6 +24,278 @@ namespace Krypton.Pipeline.Stages
 
         public void Validate(DevirtualizationCtx ctx)
         {
+            ValidateCore(ctx);
+
+            // Repairing one byte changes what the walk sees at its neighbours, and a
+            // mapping that was consistent against a wrong value can become impossible
+            // against the right one. So the repair repeats until a pass changes
+            // nothing.
+            for (var round = 0; round < TypeRefutationRounds; round++)
+            {
+                if (RepairTypeRefutedMappings(ctx) == 0)
+                    break;
+            }
+        }
+
+        // Everything above chooses mappings by counting violations, and that count
+        // cannot see types: it will settle on Conv_U8 for a byte whose input is an
+        // array, or Ldlen for one whose input is already a number. Metadata rules
+        // both out without consulting the opcode table, and by this point the rest
+        // of the table is settled, so a refutation here is attributable and safe to
+        // act on.
+        private const int TypeRefutationRounds = 4;
+        private const int MaxFreeSuspectsPerMethod = 3;
+        private const long MaxStackRepairCombinations = 2_000_000L;
+        private const long SuspectSolveNodeBudget = 20_000_000L;
+
+        private int RepairTypeRefutedMappings(DevirtualizationCtx ctx)
+        {
+            if (ctx?.VirtualizedMethods == null || ctx.PatternMatcher == null || ctx.Parser?.Operands == null)
+                return 0;
+            if (IsEnvironmentEnabled("KRYPTON_DISABLE_TYPE_REFUTATION_REPAIR"))
+                return 0;
+
+            var mapping = BuildCurrentMapping(ctx);
+
+            // A byte whose current value the types rule out at its own instruction.
+            // Some of these are innocent -- a consumer blamed for what a producer
+            // pushed -- so nothing is changed on this evidence alone.
+            var suspect = mapping.Keys
+                .Where(b => b >= 0 && b < ctx.Parser.Operands.Length)
+                .Where(b => IsRefutedAtByte(ctx, mapping, b, mapping[b]))
+                .ToHashSet();
+
+            if (suspect.Count == 0)
+                return 0;
+
+            // Suspects in the same method constrain each other: freeing one while the
+            // other stays wrong leaves the method with no consistent assignment at
+            // all, which is why they have to be solved together.
+            var feasible = new Dictionary<int, HashSet<VMOpCode>>();
+            foreach (var method in ctx.VirtualizedMethods)
+            {
+                var instructions = method?.MethodBody?.Instructions;
+                if (instructions == null || instructions.Count == 0)
+                    continue;
+
+                var free = instructions
+                    .Where(i => i != null && suspect.Contains(i.VmByte))
+                    .Select(i => i.VmByte)
+                    .Distinct()
+                    .ToList();
+
+                if (free.Count == 0)
+                    continue;
+                if (free.Count > MaxFreeSuspectsPerMethod)
+                {
+                    ctx.Options.Logger.Info(
+                        $"Type refutation: MethodKey {method.MethodKey} has {free.Count} suspect byte(s); too many to solve together.");
+                    continue;
+                }
+
+                var candidates = new Dictionary<int, HashSet<VMOpCode>>();
+                foreach (var pair in mapping)
+                {
+                    candidates[pair.Key] = free.Contains(pair.Key)
+                        ? new HashSet<VMOpCode>(VMOpCodeCatalog.GetCandidates(ctx.Parser.Operands[pair.Key]))
+                        : new HashSet<VMOpCode> { pair.Value };
+                }
+
+                JointSolverResult joint;
+                try
+                {
+                    joint = TargetedJointSolver.Solve(
+                        ctx, candidates, new[] { "key:" + method.MethodKey }, SuspectSolveNodeBudget);
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (!joint.Exhaustive || joint.Feasible == 0)
+                {
+                    ctx.Options.Logger.Info(
+                        $"Type refutation: MethodKey {method.MethodKey} left {joint.Feasible} assignment(s) " +
+                        $"for {string.Join(", ", free.Select(b => $"0x{b:X2}"))} ({joint.StopReason}).");
+                    continue;
+                }
+
+                ctx.Options.Logger.Info(
+                    $"Type refutation: MethodKey {method.MethodKey} solved {string.Join(", ", free.Select(b => $"0x{b:X2}"))} " +
+                    $"with {joint.Feasible} feasible assignment(s).");
+
+                foreach (var vmByte in free)
+                {
+                    if (!joint.FeasibleValues.TryGetValue(vmByte, out var values) || values.Count == 0)
+                        continue;
+                    if (feasible.TryGetValue(vmByte, out var known))
+                        known.IntersectWith(values);
+                    else
+                        feasible[vmByte] = new HashSet<VMOpCode>(values);
+                }
+            }
+
+            foreach (var pair in feasible.OrderBy(p => p.Key))
+            {
+                ctx.Options.Logger.Info(
+                    $"Type refutation: vm 0x{pair.Key:X2} survivors = " +
+                    string.Join(", ", pair.Value.OrderBy(v => v.ToString())));
+            }
+
+            var repaired = 0;
+            foreach (var pair in feasible.OrderBy(p => p.Key))
+            {
+                var vmByte = pair.Key;
+
+                // The depth analysis that produced the current mapping already agreed
+                // on how many values this byte takes and leaves; what it got wrong is
+                // which opcode of that shape. Candidates of a different arity only
+                // survive because a neighbouring free byte absorbs the difference, and
+                // they would silently compute something else. Keep the shape, let the
+                // types decide inside it.
+                var sameShape = pair.Value
+                    .Where(candidate => HasSameStackShape(candidate, mapping[vmByte]))
+                    .ToList();
+
+                if (!TryPickReplacement(sameShape, out var replacement) ||
+                    replacement == mapping[vmByte])
+                {
+                    continue;
+                }
+
+                var previous = mapping[vmByte];
+                if (replacement == VMOpCode.Nop)
+                    ctx.PatternMatcher.MarkKnownNoOpValue(vmByte);
+                else
+                    ctx.PatternMatcher.SetOpCodeValue(replacement, vmByte);
+
+                ctx.OpcodeConfidence ??= new Dictionary<int, OpcodeMappingConfidence>();
+                ctx.OpcodeConfidence[vmByte] = new OpcodeMappingConfidence(replacement, 1.0, "metadata-types");
+                mapping[vmByte] = replacement;
+
+                foreach (var method in ctx.VirtualizedMethods)
+                {
+                    var instructions = method?.MethodBody?.Instructions;
+                    if (instructions == null)
+                        continue;
+                    foreach (var instruction in instructions)
+                    {
+                        if (instruction == null || instruction.VmByte != vmByte)
+                            continue;
+                        instruction.OpCode = replacement;
+                        instruction.IsResolved = true;
+                    }
+                }
+
+                repaired++;
+                ctx.Options.Logger.Warning(
+                    $"Type refutation: vm 0x{vmByte:X2} {previous} -> {replacement} (metadata types rule the old one out).");
+            }
+
+            if (repaired > 0)
+                ctx.Options.Logger.Success($"Repaired {repaired} type-impossible opcode mapping(s).");
+
+            return repaired;
+        }
+
+        private static Dictionary<int, VMOpCode> BuildCurrentMapping(DevirtualizationCtx ctx)
+        {
+            var mapping = new Dictionary<int, VMOpCode>();
+            foreach (var method in ctx.VirtualizedMethods)
+            {
+                var instructions = method?.MethodBody?.Instructions;
+                if (instructions == null)
+                    continue;
+                foreach (var instruction in instructions)
+                {
+                    if (instruction == null || mapping.ContainsKey(instruction.VmByte))
+                        continue;
+                    if (ctx.PatternMatcher.IsOpCodeValueKnown(instruction.VmByte))
+                        mapping[instruction.VmByte] = ctx.PatternMatcher.GetOpCodeValue(instruction.VmByte);
+                }
+            }
+
+            return mapping;
+        }
+
+        // Only a failure the walk reaches *at this byte* counts. Anything failing
+        // elsewhere is some other byte's problem and must not decide this one.
+        private static bool IsRefutedAtByte(
+            DevirtualizationCtx ctx,
+            Dictionary<int, VMOpCode> mapping,
+            int vmByte,
+            VMOpCode opcode)
+        {
+            var previous = mapping[vmByte];
+            mapping[vmByte] = opcode;
+            try
+            {
+                foreach (var method in ctx.VirtualizedMethods)
+                {
+                    var instructions = method?.MethodBody?.Instructions;
+                    if (instructions == null)
+                        continue;
+                    if (!instructions.Any(i => i != null && i.VmByte == vmByte))
+                        continue;
+                    if (TypedStackConstraint.IsTypeConsistent(ctx, method, mapping, out _, out var index, vmByte))
+                        continue;
+                    if (index >= 0 && index < instructions.Count && instructions[index]?.VmByte == vmByte)
+                        return true;
+                }
+
+                return false;
+            }
+            finally
+            {
+                mapping[vmByte] = previous;
+            }
+        }
+
+        private static bool HasSameStackShape(VMOpCode candidate, VMOpCode current)
+        {
+            return VMOpCodeCatalog.TryGet(candidate, out var left) &&
+                   VMOpCodeCatalog.TryGet(current, out var right) &&
+                   left.HasFixedStackEffect && right.HasFixedStackEffect &&
+                   left.Pop == right.Pop && left.Push == right.Push;
+        }
+
+        // One survivor is a proof. Several are only usable when they differ in a way
+        // the CLR does not: the int32-producing conversions are interchangeable here,
+        // so the canonical one stands for the family rather than the byte staying on
+        // a mapping that is known to be impossible.
+        private static bool TryPickReplacement(IReadOnlyList<VMOpCode> survivors, out VMOpCode replacement)
+        {
+            replacement = VMOpCode.Nop;
+            if (survivors.Count == 0)
+                return false;
+            if (survivors.Count == 1)
+            {
+                replacement = survivors[0];
+                return true;
+            }
+
+            // Several survivors are only usable when the choice between them does not
+            // change what the method computes. A conversion to int32 is the one shape
+            // here that carries the value through unchanged -- Neg, Not and Localloc
+            // would each quietly compute something else -- so when the survivors are
+            // all of that kind and a conversion is among them, the canonical
+            // conversion stands in for the family. This is a preference, not a proof,
+            // and it only ever replaces a mapping the types have already ruled out.
+            if (survivors.Contains(VMOpCode.Conv_I4) &&
+                survivors.All(op => VMOpCodeCatalog.IsConversion(op) ||
+                                    op == VMOpCode.Neg ||
+                                    op == VMOpCode.Not ||
+                                    op == VMOpCode.Localloc))
+            {
+                replacement = VMOpCode.Conv_I4;
+                return true;
+            }
+
+            return false;
+        }
+
+        private void ValidateCore(DevirtualizationCtx ctx)
+        {
             if (ctx?.VirtualizedMethods == null || ctx.PatternMatcher == null || ctx.GetOperandTypes().Length == 0)
                 return;
 
